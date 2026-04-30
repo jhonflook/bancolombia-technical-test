@@ -22,7 +22,7 @@ from src.models.debit import (  # noqa: F401
 )
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.cryptodb_url)
+config.set_main_option("sqlalchemy.url", settings.debitdb_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

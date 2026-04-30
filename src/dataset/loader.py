@@ -106,31 +106,69 @@ def load_pagos(datalake: Path, chunk_size: int) -> None:
 
 
 def load_canales(datalake: Path, chunk_size: int) -> None:
-    """Load canales: summary columns as typed, remaining as JSONB features dict.
+    """Load canales using a 2-pass streaming approach to avoid OOM.
 
-    S4: rows absent from canales = no transactional activity.
-    Those rows are not in the source file so no insert is needed;
-    the LEFT JOIN in downstream queries will return NULL → impute 0.
-    Dedup strategy c: 24 key groups with conflicting values are excluded entirely.
+    The source CSV has 4,258 columns. Loading it entirely + to_dict(orient="records")
+    creates ~5 GB of Python objects, hanging low-memory machines.
+
+    Pass 1 (lightweight): reads only KEY_COLS to identify duplicate keys
+    (exact duplicates + S11 conflicting groups) without touching feature columns.
+    Over-exclusion vs original logic: exact-duplicate rows are excluded rather
+    than deduplicated (affects ~180 rows out of ~9,419 — negligible).
+
+    Pass 2 (streaming): reads the CSV in small chunks, skips excluded keys,
+    serializes feature columns to JSONB using .values.tolist() which converts
+    numpy scalars to Python-native types required by json.dumps.
+
+    S4: absent rows = no transactional activity; LEFT JOIN imputes 0 downstream.
+    S11: key groups with conflicting values excluded (24 groups, 0.25% of universe).
     """
-    df = _read_csv(datalake / DATALAKE_FILES["canales"], "canales")
-    df = _exclude_conflicting_keys(df, "canales")
+    csv_path = datalake / DATALAKE_FILES["canales"]
+    # Cap chunk size: each row ~125 KB of JSON → 50 rows ≈ 6 MB per INSERT
+    canales_chunk = min(chunk_size, 50)
 
-    feature_cols = [c for c in df.columns if c not in KEY_COLS + CANALES_SUMMARY_COLS]
+    # --- Pass 1: detect all keys with any duplication ---
+    logger.info("  canales: pre-scanning %d KEY_COLS for duplicate detection...", len(KEY_COLS))
+    keys_scan = pd.read_csv(csv_path, usecols=KEY_COLS, low_memory=False)
+    keys_scan["f_analisis"] = pd.to_datetime(keys_scan["f_analisis"]).dt.date
+    dup_mask = keys_scan.duplicated(subset=KEY_COLS, keep=False)
+    excluded_keys: set[tuple] = set()
+    if dup_mask.any():
+        excluded_keys = {
+            tuple(row)
+            for row in keys_scan.loc[dup_mask, KEY_COLS].drop_duplicates().itertuples(index=False)
+        }
+        logger.warning(
+            "  canales: %d rows map to %d duplicate keys → excluded (S11 + exact-dup)",
+            dup_mask.sum(), len(excluded_keys),
+        )
+    del keys_scan
 
-    # Build flat table: key + summary cols + features as JSON string.
-    # psycopg2 cannot adapt raw Python dicts for JSONB; json.dumps() produces
-    # a string that PostgreSQL parses and stores as JSONB automatically.
-    rows = df[KEY_COLS + CANALES_SUMMARY_COLS].copy()
-    feature_records = (
-        df[feature_cols]
-        .fillna(0)
-        .infer_objects(copy=False)
-        .to_dict(orient="records")
-    )
-    rows["features"] = [json.dumps(d) for d in feature_records]
+    # --- Pass 2: stream full CSV, build JSONB per chunk ---
+    logger.info("  canales: streaming CSV with chunk_size=%d", canales_chunk)
+    loaded = 0
+    for chunk in pd.read_csv(csv_path, chunksize=canales_chunk, low_memory=False):
+        chunk["f_analisis"] = pd.to_datetime(chunk["f_analisis"]).dt.date
 
-    _load_table(rows, "debit_canales", chunk_size)
+        if excluded_keys:
+            key_tuples = list(zip(chunk["num_doc"], chunk["obl17"], chunk["f_analisis"]))
+            chunk = chunk.loc[[k not in excluded_keys for k in key_tuples]]
+
+        if chunk.empty:
+            continue
+
+        feature_cols = [c for c in chunk.columns if c not in KEY_COLS + CANALES_SUMMARY_COLS]
+        rows = chunk[KEY_COLS + CANALES_SUMMARY_COLS].copy()
+
+        # .values.tolist() converts numpy scalars → Python native (required by json.dumps)
+        feat_values = chunk[feature_cols].fillna(0).values.tolist()
+        rows["features"] = [json.dumps(dict(zip(feature_cols, v))) for v in feat_values]
+
+        rows.to_sql("debit_canales", engine, if_exists="append", index=False, method="multi")
+        loaded += len(rows)
+        logger.info("  debit_canales: %d rows loaded so far", loaded)
+
+    logger.info("  canales: %d total rows loaded", loaded)
 
 
 def _truncate_debit_tables() -> None:
@@ -144,31 +182,49 @@ def _truncate_debit_tables() -> None:
     logger.info("All debit tables truncated.")
 
 
-def run(datalake_path: str = "./datalake", chunk_size: int = 5000, truncate: bool = False) -> None:
-    """Execute full load pipeline for all 6 debit source files.
+_LOADERS = {
+    "clientes":   load_clientes,
+    "excedentes": load_excedentes,
+    "gestiones":  load_gestiones,
+    "moras":      load_moras,
+    "pagos":      load_pagos,
+    "canales":    load_canales,
+}
+
+
+def run(
+    datalake_path: str = "./datalake",
+    chunk_size: int = 5000,
+    truncate: bool = False,
+    tables: list[str] | None = None,
+) -> None:
+    """Execute the load pipeline for debit source files.
 
     Parameters
     ----------
     datalake_path:
         Path to the directory containing the 6 CSV files.
     chunk_size:
-        Number of rows per insert batch.
+        Number of rows per insert batch (canales is capped internally at 50).
     truncate:
-        If True, truncate all debit tables before loading (idempotent re-run).
+        If True, truncate target tables before loading (idempotent re-run).
+    tables:
+        Subset of table aliases to load. None means all 6 tables.
     """
     datalake = Path(datalake_path)
+    selected = tables if tables else list(_LOADERS)
+
+    unknown = set(selected) - set(_LOADERS)
+    if unknown:
+        raise ValueError(f"Unknown table(s): {unknown}. Valid: {list(_LOADERS)}")
 
     if truncate:
         _truncate_debit_tables()
 
-    load_clientes(datalake, chunk_size)
-    load_excedentes(datalake, chunk_size)
-    load_gestiones(datalake, chunk_size)
-    load_moras(datalake, chunk_size)
-    load_pagos(datalake, chunk_size)
-    load_canales(datalake, chunk_size)
+    for alias in selected:
+        _LOADERS[alias](datalake, chunk_size)
 
-    logger.info("All debit tables loaded successfully.")
+    logger.info("Loaded tables: %s", selected)
 
 
 if __name__ == "__main__":
@@ -178,10 +234,19 @@ if __name__ == "__main__":
     parser.add_argument("--datalake-path", default="./datalake")
     parser.add_argument("--chunk-size", type=int, default=5000)
     parser.add_argument("--truncate", action="store_true", help="Truncate tables before loading")
+    parser.add_argument(
+        "--table",
+        dest="tables",
+        nargs="+",
+        choices=list(_LOADERS),
+        metavar="TABLE",
+        help="Load only specific table(s): clientes excedentes gestiones moras pagos canales",
+    )
     args = parser.parse_args()
 
     run(
         datalake_path=args.datalake_path,
         chunk_size=args.chunk_size,
         truncate=args.truncate,
+        tables=args.tables,
     )
