@@ -1,0 +1,19 @@
+*.json
+*__pycache__/
+.env
+*.log
+CLAUDE.md
+.mcp.json
+*.egg-info/
+
+.claude/
+data/queries/*
+data/database/*
+data/mlflow/*
+*_agent_jobs/*
+
+datalake/*
+figures/*
+# Ignore all .png files
+*.png
+*.jpg
