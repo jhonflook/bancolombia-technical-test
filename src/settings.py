@@ -25,8 +25,8 @@ class Settings(BaseSettings):
     postgres_port: str = "5432"
 
     @property
-    def cryptodb_url(self) -> str:
-        """Build the cryptodb connection URL from components."""
+    def debitdb_url(self) -> str:
+        """Build the debitdb connection URL from components."""
         return f"postgresql://{self.postgres_user}:{self.postgres_password}@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
 
 

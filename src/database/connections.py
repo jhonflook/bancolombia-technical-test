@@ -1,4 +1,4 @@
-"""Database and MLflow connection configuration."""
+"""Configuración de conexiones a la base de datos y MLflow — débitos recurrentes."""
 
 from contextlib import contextmanager
 
@@ -8,7 +8,7 @@ from sqlmodel import Session, create_engine
 from src.settings import settings
 
 # Database engine
-engine = create_engine(settings.cryptodb_url)
+engine = create_engine(settings.debitdb_url)
 
 
 @contextmanager

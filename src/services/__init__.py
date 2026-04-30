@@ -1,21 +1,16 @@
-"""Services module for training, optimization, and forecasting."""
+"""Servicios de entrenamiento, scoring y selección de modelos — débitos recurrentes."""
 
-from src.services.forecasting import ForecastingService
-from src.services.optimization import (
-    HyperparameterOptimizer,
-    MLflowTrialCallback,
-    create_objective_with_feature_selection,
-)
-from src.services.training import TrainingResult, TrainingService
+from src.services.forecasting import DebitScoringService
+from src.services.optimization import ModelSelectionService
+from src.services.training import PartitionMetrics, run_training_pipeline, train_xgboost
 
 __all__ = [
-    # Training
-    "TrainingService",
-    "TrainingResult",
-    # Optimization
-    "HyperparameterOptimizer",
-    "MLflowTrialCallback",
-    "create_objective_with_feature_selection",
-    # Forecasting
-    "ForecastingService",
+    # Entrenamiento XGBoost standalone
+    "run_training_pipeline",
+    "train_xgboost",
+    "PartitionMetrics",
+    # Scoring por lotes
+    "DebitScoringService",
+    # Selección de modelos desde MLflow
+    "ModelSelectionService",
 ]

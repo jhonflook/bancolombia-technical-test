@@ -1,319 +1,331 @@
 #!/usr/bin/env python3
 """
-Train cryptocurrency price prediction models using percentage change approach.
+Entrenamiento y comparación de clasificadores de débitos recurrentes.
 
-This script trains ML models for bitcoin, ethereum, and cardano using:
-- MLflow for experiment tracking
-- Optuna for hyperparameter optimization
-- Time-series cross-validation
-- Saves forecasts (always as price_usd) to the database
+Entrena múltiples clasificadores del MODEL_REGISTRY con optimización de
+hiperparámetros vía Optuna, evalúa en Train / Test / OOT y registra el
+mejor modelo en MLflow.
 
-Target options:
-- 'price_usd': Direct price prediction
-- 'pct_change': Predict daily percentage change, then convert to price
+Uso:
+    uv run python deploy/train_debit_classifier.py --data-dir data/artifacts
+    uv run python deploy/train_debit_classifier.py --models xgboost random_forest
+    uv run python deploy/train_debit_classifier.py --models xgboost --n-trials 50
+    uv run python deploy/train_debit_classifier.py --models logistic_regression --n-trials 0
 
-Available models:
-- ridge, elasticnet, random_forest, gradient_boosting (sklearn-based)
-- sarimax, prophet (time series models)
-
-Usage:
-    uv run python deploy/train_debit_classifier.py
-    uv run python deploy/train_debit_classifier.py --target pct_change
-    uv run python deploy/train_debit_classifier.py --coins bitcoin ethereum --target pct_change
-    uv run python deploy/train_debit_classifier.py --n-trials 50 --forecast-days 15 --target price_usd
-    uv run python deploy/train_debit_classifier.py --models ridge elasticnet prophet
+Modelos disponibles: xgboost, random_forest, gradient_boosting, logistic_regression
+Default:             xgboost, random_forest, gradient_boosting
 """
 
 import argparse
+import json
 import logging
-from datetime import date, timedelta
+import pickle
+from pathlib import Path
 
 import mlflow
+import optuna
 import pandas as pd
-from sqlmodel import Session, create_engine
 
-from src.database import get_mlflow_tracking_uri, setup_mlflow
-from src.database.crud import get_coin_data
-from src.dataset import engineer_all_features
-from src.models import TargetType
-from src.services import ForecastingService, TrainingService
-from src.settings import settings
-from src.statistical_models import MODEL_REGISTRY
+from src.statistical_models import DEFAULT_MODELS, MODEL_REGISTRY
+from src.statistical_models.evaluation import compute_classification_metrics, evaluate_classifier_cv
 
-# Default models to train (sklearn-based, more stable for optimization)
-DEFAULT_MODELS = ["ridge", "elasticnet", "random_forest", "gradient_boosting"]
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+EXPERIMENT_NAME = "debit_recurrence_classifier"
+TARGET_COL = "var_rta"
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command line arguments."""
+    """Parsear argumentos de línea de comandos."""
     parser = argparse.ArgumentParser(
-        description="Train cryptocurrency price prediction models"
+        description="Entrenar y comparar clasificadores de débitos recurrentes"
     )
     parser.add_argument(
-        "--coins",
-        nargs="+",
-        default=["bitcoin", "ethereum", "cardano"],
-        help="Coins to train models for",
+        "--data-dir",
+        default="data/artifacts",
+        help="Directorio con train.parquet, test.parquet, oot.parquet y feature_cols.json",
     )
     parser.add_argument(
-        "--target",
-        type=str,
-        choices=["price_usd", "pct_change"],
-        default="pct_change",
-        help="Target variable: 'price_usd' or 'pct_change' (default: pct_change)",
+        "--mlflow-uri",
+        default="http://localhost:5000",
+        help="URI del servidor MLflow",
     )
     parser.add_argument(
         "--n-trials",
         type=int,
         default=30,
-        help="Number of Optuna trials per model",
-    )
-    parser.add_argument(
-        "--forecast-days",
-        type=int,
-        default=15,
-        help="Number of days to forecast",
-    )
-    parser.add_argument(
-        "--start-date",
-        type=str,
-        default=None,
-        help="Start date for training data (YYYY-MM-DD)",
-    )
-    parser.add_argument(
-        "--end-date",
-        type=str,
-        default=None,
-        help="End date for training data (YYYY-MM-DD)",
+        help="Trials Optuna por modelo (0 = solo parámetros por defecto)",
     )
     parser.add_argument(
         "--models",
         nargs="+",
         default=None,
         choices=list(MODEL_REGISTRY.keys()),
-        help=f"Models to train. Available: {', '.join(MODEL_REGISTRY.keys())}. "
-        f"Default: {', '.join(DEFAULT_MODELS)}",
+        help=(
+            f"Modelos a entrenar. Disponibles: {', '.join(MODEL_REGISTRY.keys())}. "
+            f"Default: {', '.join(DEFAULT_MODELS)}"
+        ),
     )
     return parser.parse_args()
 
 
-def load_coin_data(
-    coins: list[str], start_date: date, end_date: date
-) -> dict[str, pd.DataFrame]:
-    """Load data for all coins from database."""
-    engine = create_engine(settings.cryptodb_url)
-    session = Session(engine)
+def _compute_scale_pos_weight(y: pd.Series) -> float:
+    """Calcular cociente n_neg/n_pos para corrección de desbalance (S8)."""
+    n_pos = int(y.sum())
+    n_neg = int(len(y) - n_pos)
+    return float(n_neg / n_pos) if n_pos > 0 else 1.0
 
-    coin_data = {}
-    for coin in coins:
-        data = get_coin_data(session, coin, start_date, end_date)
-        df = pd.DataFrame(data.model_dump().get("coin_dataset"))
-        df["date"] = pd.to_datetime(df["date"])
-        df = df.sort_values("date").reset_index(drop=True)
-        coin_data[coin] = df
+
+def optimize_hyperparams(
+    model_name: str,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    feature_cols: list[str],
+    n_trials: int,
+    scale_pos_weight: float,
+) -> dict:
+    """Optimizar hiperparámetros de un clasificador con Optuna.
+
+    Usa validación cruzada estratificada (5 folds) sobre el conjunto de
+    entrenamiento. La métrica de optimización es AUC-ROC medio (S8).
+
+    Parameters
+    ----------
+    model_name : str
+        Clave en MODEL_REGISTRY.
+    X_train : pd.DataFrame
+        Features de entrenamiento.
+    y_train : pd.Series
+        Target binario de entrenamiento.
+    feature_cols : list[str]
+        Features seleccionados.
+    n_trials : int
+        Número de trials Optuna.
+    scale_pos_weight : float
+        Cociente n_neg/n_pos para corrección de desbalance.
+
+    Returns
+    -------
+    dict
+        Mejores hiperparámetros encontrados.
+    """
+    model_class = MODEL_REGISTRY[model_name]
+
+    def objective(trial: optuna.Trial) -> float:
+        params = model_class().get_hyperparameter_space(trial)
+        cv = evaluate_classifier_cv(
+            model_class=model_class,
+            X=X_train,
+            y=y_train,
+            selected_features=feature_cols,
+            params=params,
+            n_splits=5,
+            scale_pos_weight=scale_pos_weight,
+        )
+        return cv.mean_auc
+
+    study = optuna.create_study(direction="maximize", study_name=f"debit_{model_name}")
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+    logger.info(
+        "[%s] Optuna completado | best_cv_auc=%.4f | params=%s",
+        model_name, study.best_value, study.best_params,
+    )
+    return study.best_params
+
+
+def train_and_evaluate(
+    model_name: str,
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
+    df_oot: pd.DataFrame,
+    feature_cols: list[str],
+    best_params: dict,
+    scale_pos_weight: float,
+    data_path: Path,
+) -> dict:
+    """Entrenar modelo final y evaluar en Train / Test / OOT.
+
+    Parameters
+    ----------
+    model_name : str
+        Clave en MODEL_REGISTRY.
+    df_train : pd.DataFrame
+        Partición de entrenamiento (S7).
+    df_test : pd.DataFrame
+        Partición de test (S7).
+    df_oot : pd.DataFrame
+        Partición OOT — out-of-time (S7).
+    feature_cols : list[str]
+        Features seleccionados.
+    best_params : dict
+        Hiperparámetros optimizados (o vacío si n_trials=0).
+    scale_pos_weight : float
+        Cociente n_neg/n_pos para corrección de desbalance (S8).
+    data_path : Path
+        Directorio donde se guarda el artefacto pkl.
+
+    Returns
+    -------
+    dict
+        Diccionario con 'model', 'metrics', 'artifact_path', 'test_auc'.
+    """
+    model_class = MODEL_REGISTRY[model_name]
+    clf = model_class()
+
+    logger.info("[%s] Entrenando modelo final | params=%s", model_name, best_params)
+    X_tr = df_train[feature_cols].fillna(0.0)
+    y_tr = df_train[TARGET_COL].astype(int)
+    clf.fit(X_tr, y_tr, selected_features=feature_cols,
+            scale_pos_weight=scale_pos_weight, **best_params)
+
+    all_metrics: dict[str, float] = {}
+    for partition, df_part in [("train", df_train), ("test", df_test), ("oot", df_oot)]:
+        X_part = df_part[feature_cols].fillna(0.0)
+        y_part = df_part[TARGET_COL].astype(int)
+        y_prob = clf.predict_proba(X_part)
+
+        part_metrics = compute_classification_metrics(y_part.values, y_prob, partition=partition)
+        all_metrics.update(part_metrics)
+
         logger.info(
-            f"Loaded {coin}: {len(df)} records "
-            f"({df['date'].min().date()} to {df['date'].max().date()})"
+            "[%s | %s] n=%d | AUC=%.4f | KS=%.4f | F1@0.5=%.3f | AUC-PR=%.4f",
+            model_name, partition, len(df_part),
+            part_metrics[f"{partition}_auc_roc"],
+            part_metrics[f"{partition}_ks"],
+            part_metrics[f"{partition}_f1_05"],
+            part_metrics[f"{partition}_auc_pr"],
         )
 
-    session.close()
-    return coin_data
+    artifact_path = data_path / f"model_{model_name}.pkl"
+    with open(artifact_path, "wb") as fh:
+        pickle.dump({"model": clf, "feature_cols": feature_cols}, fh)
+
+    return {
+        "model":         clf,
+        "metrics":       all_metrics,
+        "artifact_path": artifact_path,
+        "test_auc":      all_metrics["test_auc_roc"],
+    }
 
 
-def log_parent_run_metrics(all_metrics: dict, best_model_name: str, best_result) -> None:
-    """Log comprehensive metrics at parent run level for MLflow UI."""
-    # Optimization metrics (CV RMSE for each model)
-    for model_name, opt_metrics in all_metrics["optimization"].items():
-        mlflow.log_metric(f"{model_name}_cv_rmse", opt_metrics["best_cv_rmse"])
-        mlflow.log_metric(f"{model_name}_cv_r2", opt_metrics["best_cv_r2"])
-
-    # Validation metrics (train/test for each model)
-    for model_name, val_metrics in all_metrics["validation"].items():
-        mlflow.log_metric(f"{model_name}_train_rmse", val_metrics["train_rmse"])
-        mlflow.log_metric(f"{model_name}_test_rmse", val_metrics["test_rmse"])
-        mlflow.log_metric(f"{model_name}_train_mae", val_metrics["train_mae"])
-        mlflow.log_metric(f"{model_name}_test_mae", val_metrics["test_mae"])
-        mlflow.log_metric(f"{model_name}_train_r2", val_metrics["train_r2"])
-        mlflow.log_metric(f"{model_name}_test_r2", val_metrics["test_r2"])
-
-    # Feature selection metrics
-    for model_name, feat_metrics in all_metrics["feature_selection"].items():
-        mlflow.log_metric(f"{model_name}_n_features", feat_metrics["n_features"])
-
-    # Best model summary
-    mlflow.log_param("best_model", best_model_name)
-    mlflow.log_metric(
-        "best_model_cv_rmse",
-        all_metrics["optimization"][best_model_name]["best_cv_rmse"],
-    )
-    mlflow.log_metric("best_model_test_rmse", best_result.metrics.test_rmse)
-    mlflow.log_metric("best_model_test_mae", best_result.metrics.test_mae)
-    mlflow.log_metric("best_model_test_r2", best_result.metrics.test_r2)
-    mlflow.log_metric("best_model_train_rmse", best_result.metrics.train_rmse)
-    mlflow.log_metric("best_model_train_r2", best_result.metrics.train_r2)
-    mlflow.log_metric(
-        "best_model_n_features",
-        all_metrics["feature_selection"][best_model_name]["n_features"],
-    )
-
-
-def main():
-    """Main entry point for training forecast models."""
+def main() -> None:
+    """Entrypoint principal: carga splits → optimiza → entrena → evalúa → MLflow."""
     args = parse_args()
-    target_type: TargetType = args.target
-    model_names = args.models if args.models else DEFAULT_MODELS
+    model_names = args.models or DEFAULT_MODELS
+    data_path = Path(args.data_dir)
 
-    # Setup MLflow
-    experiment = setup_mlflow(f"crypto_price_prediction_{target_type}")
+    # Cargar particiones temporales (S7)
+    df_train = pd.read_parquet(data_path / "train.parquet")
+    df_test  = pd.read_parquet(data_path / "test.parquet")
+    df_oot   = pd.read_parquet(data_path / "oot.parquet")
+
+    with open(data_path / "feature_cols.json") as fh:
+        feature_cols: list[str] = json.load(fh)
 
     logger.info("=" * 70)
-    logger.info("CRYPTOCURRENCY PRICE PREDICTION TRAINING")
+    logger.info("DEBIT RECURRENCE CLASSIFIER — ENTRENAMIENTO MULTI-MODELO")
     logger.info("=" * 70)
-    logger.info(f"MLflow Tracking URI: {get_mlflow_tracking_uri()}")
-    logger.info(f"Experiment: {experiment.name}")
-    logger.info(f"Target type: {target_type}")
-    logger.info(f"Coins: {args.coins}")
-    logger.info(f"Models: {model_names}")
-    logger.info(f"Optuna trials per model: {args.n_trials}")
-    logger.info(f"Forecast horizon: {args.forecast_days} days")
+    logger.info("Modelos:   %s", model_names)
+    logger.info("Features:  %d | train=%d | test=%d | oot=%d",
+                len(feature_cols), len(df_train), len(df_test), len(df_oot))
+    logger.info("n_trials:  %d", args.n_trials)
 
-    # Date range
-    end_date = date.fromisoformat(args.end_date) if args.end_date else date.today()
-    start_date = (
-        date.fromisoformat(args.start_date)
-        if args.start_date
-        else end_date - timedelta(days=365)
-    )
-    logger.info(f"Training data range: {start_date} to {end_date}")
+    scale_pos_weight = _compute_scale_pos_weight(df_train[TARGET_COL].astype(int))
+    logger.info("scale_pos_weight=%.3f  (desbalance S8)", scale_pos_weight)
 
-    # Load and prepare data
-    coin_data = load_coin_data(args.coins, start_date, end_date)
+    mlflow.set_tracking_uri(args.mlflow_uri)
+    mlflow.set_experiment(EXPERIMENT_NAME)
 
-    logger.info(f"Engineering features (target_type={target_type})...")
-    for coin in args.coins:
-        coin_data[coin] = engineer_all_features(coin_data[coin], target_type)
+    results: dict[str, dict] = {}
 
-    # Initialize services
-    training_service = TrainingService(
-        n_trials=args.n_trials,
-        target_type=target_type,
-        model_names=model_names,
-    )
-    forecasting_service = ForecastingService(target_type=target_type)
+    with mlflow.start_run(run_name="debit_classifier_comparison") as parent_run:
+        mlflow.log_params({
+            "models":           ",".join(model_names),
+            "n_trials":         args.n_trials,
+            "n_features":       len(feature_cols),
+            "n_train":          len(df_train),
+            "n_test":           len(df_test),
+            "n_oot":            len(df_oot),
+            "scale_pos_weight": round(scale_pos_weight, 4),
+            "target_col":       TARGET_COL,
+        })
 
-    # Train models for each coin
-    results = {}
+        for model_name in model_names:
+            logger.info("=" * 50)
+            logger.info("MODELO: %s", model_name.upper())
 
-    for coin in args.coins:
-        logger.info("=" * 70)
-        logger.info(f"TRAINING {coin.upper()} (target: {target_type})")
-        logger.info("=" * 70)
+            with mlflow.start_run(run_name=f"debit_{model_name}", nested=True):
+                # Optimización de hiperparámetros con Optuna
+                if args.n_trials > 0:
+                    best_params = optimize_hyperparams(
+                        model_name=model_name,
+                        X_train=df_train[feature_cols].fillna(0.0),
+                        y_train=df_train[TARGET_COL].astype(int),
+                        feature_cols=feature_cols,
+                        n_trials=args.n_trials,
+                        scale_pos_weight=scale_pos_weight,
+                    )
+                else:
+                    best_params = {}
 
-        with mlflow.start_run(run_name=f"{coin}_{target_type}_training"):
-            parent_run_id = mlflow.active_run().info.run_id
-            mlflow.log_param("coin_id", coin)
-            mlflow.log_param("target_type", target_type)
-            mlflow.log_param("models", ",".join(model_names))
-            mlflow.log_param("n_trials", args.n_trials)
-            mlflow.log_param("forecast_days", args.forecast_days)
-            mlflow.log_param("start_date", str(start_date))
-            mlflow.log_param("end_date", str(end_date))
+                mlflow.log_params({"model_type": model_name, **best_params})
 
-            # Train all models and get best
-            best_result, predictions, best_model_name, all_metrics = (
-                training_service.train_coin_models(
-                    coin_id=coin,
-                    df=coin_data[coin],
-                    forecast_days=args.forecast_days,
+                # Entrenamiento final y evaluación en las 3 particiones
+                result = train_and_evaluate(
+                    model_name=model_name,
+                    df_train=df_train,
+                    df_test=df_test,
+                    df_oot=df_oot,
+                    feature_cols=feature_cols,
+                    best_params=best_params,
+                    scale_pos_weight=scale_pos_weight,
+                    data_path=data_path,
                 )
+                results[model_name] = result
+
+                mlflow.log_metrics(result["metrics"])
+                mlflow.log_artifact(str(result["artifact_path"]))
+
+                # Importancia de features (si el modelo la expone)
+                importances = result["model"].get_feature_importances()
+                if importances:
+                    top30 = sorted(importances.items(), key=lambda x: x[1], reverse=True)[:30]
+                    mlflow.log_param(
+                        "top_features",
+                        json.dumps({k: round(float(v), 5) for k, v in top30}),
+                    )
+
+        # Selección del mejor modelo por AUC-ROC en Test
+        best_name = max(results, key=lambda m: results[m]["test_auc"])
+        best_result = results[best_name]
+
+        mlflow.log_params({"best_model": best_name})
+        mlflow.log_metrics({
+            "best_test_auc_roc": best_result["metrics"]["test_auc_roc"],
+            "best_test_ks":      best_result["metrics"]["test_ks"],
+            "best_oot_auc_roc":  best_result["metrics"]["oot_auc_roc"],
+            "best_oot_ks":       best_result["metrics"]["oot_ks"],
+        })
+
+        logger.info("=" * 70)
+        logger.info("RESUMEN FINAL")
+        logger.info("=" * 70)
+        for name, res in results.items():
+            marker = "  <-- MEJOR" if name == best_name else ""
+            logger.info(
+                "%-22s Test AUC=%.4f | Test KS=%.4f | OOT AUC=%.4f | OOT KS=%.4f%s",
+                name,
+                res["metrics"]["test_auc_roc"],
+                res["metrics"]["test_ks"],
+                res["metrics"]["oot_auc_roc"],
+                res["metrics"]["oot_ks"],
+                marker,
             )
-
-            results[coin] = {
-                "best_model": best_model_name,
-                "metrics": best_result.metrics,
-                "predictions": predictions,
-                "run_id": best_result.run_id,
-                "parent_run_id": parent_run_id,
-                "selected_features": best_result.selected_features,
-            }
-
-            # Log metrics at parent level
-            log_parent_run_metrics(all_metrics, best_model_name, best_result)
-
-            # Log and save predictions
-            with mlflow.start_run(run_name=f"{coin}_predictions", nested=True) as pred_run:
-                mlflow.log_param("coin_id", coin)
-                mlflow.log_param("target_type", target_type)
-                mlflow.log_param("model_used", best_model_name)
-                mlflow.log_param("forecast_days", args.forecast_days)
-                mlflow.log_metric("predicted_price_min", predictions["predicted_price"].min())
-                mlflow.log_metric("predicted_price_max", predictions["predicted_price"].max())
-                mlflow.log_metric("predicted_price_mean", predictions["predicted_price"].mean())
-
-                # Save predictions to database
-                forecasting_service.save_predictions_to_db(
-                    predictions=predictions,
-                    coin_id=coin,
-                    run_id=pred_run.info.run_id,
-                )
-
-                # Save forecast metadata to database
-                forecasting_service.save_metadata_to_db(
-                    forecast_id=pred_run.info.run_id,
-                    coin_id=coin,
-                    model_type=best_model_name,
-                    mape=best_result.metrics.test_mape,
-                    rmse=best_result.metrics.test_rmse,
-                    r2=best_result.metrics.test_r2,
-                    mae=best_result.metrics.test_mae,
-                    n_train_samples=best_result.metrics.n_train_samples,
-                    n_test_samples=best_result.metrics.n_test_samples,
-                    n_trials=args.n_trials,
-                    n_features=len(best_result.selected_features),
-                    selected_features=best_result.selected_features,
-                    forecast_days=args.forecast_days,
-                    train_start_date=start_date,
-                    train_end_date=end_date,
-                    mlflow_run_id=parent_run_id,
-                    tag="unofficial",
-                )
-
-    # Print summary
-    logger.info("=" * 70)
-    logger.info("TRAINING COMPLETE - SUMMARY")
-    logger.info("=" * 70)
-    logger.info(f"Target type used: {target_type}")
-
-    unit = "%" if target_type == "pct_change" else "$"
-
-    for coin, result in results.items():
-        logger.info(f"\n{coin.upper()}:")
-        logger.info(f"  Best Model: {result['best_model']}")
-        logger.info(f"  Test RMSE: {result['metrics'].test_rmse:.4f}{unit}")
-        logger.info(f"  Test MAE: {result['metrics'].test_mae:.4f}{unit}")
-        logger.info(f"  Test MAPE: {result['metrics'].test_mape:.2f}%")
-        logger.info(f"  Test R2: {result['metrics'].test_r2:.4f}")
-        logger.info(
-            f"  Samples: {result['metrics'].n_train_samples} train, "
-            f"{result['metrics'].n_test_samples} test"
-        )
-        logger.info(
-            f"  Predictions: {result['predictions']['date'].min().date()} "
-            f"to {result['predictions']['date'].max().date()}"
-        )
-        logger.info(
-            f"  Price Range (USD): ${result['predictions']['predicted_price'].min():,.2f} "
-            f"- ${result['predictions']['predicted_price'].max():,.2f}"
-        )
-        logger.info(f"  MLflow Run ID: {result['parent_run_id']}")
-
-    logger.info(f"\nView results at: {get_mlflow_tracking_uri()}")
+        logger.info("MLflow run_id: %s", parent_run.info.run_id)
+        logger.info("Ver resultados en: %s", args.mlflow_uri)
 
 
 if __name__ == "__main__":
