@@ -20,6 +20,7 @@ Supuestos activos (referenciados en el código):
 """
 
 import argparse
+import gc
 import logging
 from pathlib import Path
 
@@ -71,17 +72,26 @@ def load_raw_sources(datalake_path: Path | str = "datalake") -> dict[str, pd.Dat
     -----
     S1: la clave primaria compuesta se mantiene como string hasta el join.
     S2: num_doc y obl17 son hashes; no se infiere ningún atributo de ellos.
+
+    Nota de memoria: solo las JOIN_KEYS se leen como str. Las columnas de
+    features se infieren directamente como float64/int64 por el motor C de
+    pandas, evitando ~3 GB de objetos Python intermedios que generaba el
+    patrón anterior (dtype=str + loop pd.to_numeric × 4 258 cols en canales).
     """
     base = Path(datalake_path)
     sources: dict[str, pd.DataFrame] = {}
 
     for alias, filename in _CSV_FILES.items():
-        df = pd.read_csv(base / filename, sep=None, engine="python", dtype=str)
-        df["f_analisis"] = pd.to_datetime(df["f_analisis"])
+        filepath = base / filename
 
-        non_key = [c for c in df.columns if c not in JOIN_KEYS]
-        for col in non_key:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        # Peek at header to identify which JOIN_KEYS exist in this file
+        present_keys = set(pd.read_csv(filepath, nrows=0).columns) & set(JOIN_KEYS)
+        key_dtypes = {k: str for k in present_keys}
+
+        # C engine (default); only JOIN_KEYS forced to str.
+        # Feature columns are inferred as float64/int64 — no conversion loop needed.
+        df = pd.read_csv(filepath, dtype=key_dtypes, low_memory=False)
+        df["f_analisis"] = pd.to_datetime(df["f_analisis"])
 
         sources[alias] = df
         logger.info("Cargado %-12s %6d filas x %d cols", alias, len(df), len(df.columns))
@@ -119,22 +129,29 @@ def build_analytical_model(datalake_path: Path | str = "datalake") -> pd.DataFra
            antes de entrenar.
     """
     sources = load_raw_sources(datalake_path)
-    base = sources["clientes"].copy()
+    base = sources.pop("clientes")
 
     # Fuentes con cobertura completa (45 731 obligaciones únicas c/u)
     for alias in ("excedentes", "gestiones", "moras", "pagos"):
-        feat = sources[alias].drop_duplicates(subset=JOIN_KEYS)
+        feat = sources.pop(alias).drop_duplicates(subset=JOIN_KEYS)
         base = base.merge(feat, on=JOIN_KEYS, how="left")
+        del feat
+        gc.collect()
         logger.info("Tras join %-12s %d filas", alias, len(base))
 
     # canales: cobertura parcial ~20.7% — S4: ausencia = sin actividad -> 0
-    canales = sources["canales"].drop_duplicates(subset=JOIN_KEYS)
+    canales = sources.pop("canales").drop_duplicates(subset=JOIN_KEYS)
+    # Pre-filtrar canales antes del merge para evitar OOM (~4 255 cols → ~100–150)
+    canales = _filter_sparse_canales(canales)
     canales_feat_cols = [c for c in canales.columns if c not in JOIN_KEYS]
     base = base.merge(canales, on=JOIN_KEYS, how="left")
-    base[canales_feat_cols] = base[canales_feat_cols].fillna(0)
+    del canales
+    gc.collect()
+    base.fillna({col: 0 for col in canales_feat_cols}, inplace=True)
     logger.info("Tras join %-12s %d filas", "canales", len(base))
 
     base = _impute_excedentes(base)
+    gc.collect()
 
     dist = base[TARGET_COL].value_counts().to_dict() if TARGET_COL in base.columns else {}
     logger.info(
@@ -168,10 +185,50 @@ def _impute_excedentes(df: pd.DataFrame) -> pd.DataFrame:
         if "excedente_pago" in c or "porc_pago" in c
     ]
     if exc_cols:
-        df = df.copy()
-        df[exc_cols] = df[exc_cols].fillna(0)
+        # inplace: evita copiar el DataFrame completo (~1.7 GB) solo para imputar 8 cols
+        df.fillna({col: 0 for col in exc_cols}, inplace=True)
         logger.debug("Imputados %d cols de excedentes con 0 (S5)", len(exc_cols))
     return df
+
+
+# ─── Pre-filtrado de canales ─────────────────────────────────────────────────
+
+
+def _filter_sparse_canales(canales: pd.DataFrame, threshold: float = 0.95) -> pd.DataFrame:
+    """Eliminar columnas de canales con demasiados ceros antes del merge.
+
+    Parameters
+    ----------
+    canales : pd.DataFrame
+        DataFrame fuente de canales (9 419 filas × 4 258 cols).
+    threshold : float
+        Fracción máxima de ceros permitida dentro de las filas de canales.
+        Default 0.95 (≥ 5% no-cero en canales ≡ ≥ 1% no-cero en el universo
+        completo de 46 736 filas, equivalente al filtro sparsity > 99% de
+        select_feature_columns sobre el universo completo).
+
+    Returns
+    -------
+    pd.DataFrame
+        canales con solo JOIN_KEYS + columnas con señal suficiente.
+
+    Notes
+    -----
+    Matemática: cobertura_canales = 9 419 / 46 736 ≈ 20.7%.
+    Una col con s% ceros en canales tendrá (s × 0.207 + 0.793) ceros en el
+    universo → supera 99% de sparsity global si s > 0.9504.
+    Con threshold = 0.95 se conservan todas las cols que sobrevivirían al
+    filtro downstream, reduciendo canales de ~4 252 a ~100–150 cols y
+    evitando el OOM al construir el DataFrame analítico (~1.7 GB → ~80 MB).
+    """
+    feat_cols = [c for c in canales.columns if c not in JOIN_KEYS]
+    sparsity = (canales[feat_cols] == 0).mean()
+    keep = sparsity[sparsity <= threshold].index.tolist()
+    logger.info(
+        "Canales pre-filtrado: %d → %d cols (sparsity <= %.0f%% en filas de canales)",
+        len(feat_cols), len(keep), threshold * 100,
+    )
+    return canales[JOIN_KEYS + keep]
 
 
 # ─── Validación ──────────────────────────────────────────────────────────────
@@ -216,11 +273,21 @@ def validate_join_integrity(df: pd.DataFrame) -> dict:
 
     trx_cols = [c for c in df.columns if c.startswith("trx_")]
     if trx_cols:
-        con_actividad = (df[trx_cols] > 0).any(axis=1)
+        # Chunks de 500 cols para no materializar toda la matriz booleana de ~4 255 cols
+        _CHUNK = 500
+        con_actividad = pd.Series(False, index=df.index)
+        for i in range(0, len(trx_cols), _CHUNK):
+            con_actividad |= (df[trx_cols[i:i + _CHUNK]] > 0).any(axis=1)
         report["cobertura_canales_pct"] = round(con_actividad.mean() * 100, 2)
 
-    nulos = df.isnull().sum()
-    report["nulos_restantes"] = nulos[nulos > 0].to_dict()
+    # Null check en chunks de 300 cols para limitar el tamaño del array booleano intermedio
+    nulos: dict[str, int] = {}
+    _CHUNK = 300
+    all_cols = df.columns.tolist()
+    for i in range(0, len(all_cols), _CHUNK):
+        chunk_nulls = df[all_cols[i:i + _CHUNK]].isnull().sum()
+        nulos.update(chunk_nulls[chunk_nulls > 0].to_dict())
+    report["nulos_restantes"] = nulos
 
     report["ok"] = (
         report["claves_duplicadas"] == 0
@@ -369,6 +436,10 @@ if __name__ == "__main__":
     if not report["ok"]:
         logger.warning("Integrity issues detected: %s", report)
 
+    gc.collect()
     out_path = output / "analytical_model.parquet"
     df.to_parquet(out_path, index=False)
     logger.info("Analytical model saved to %s (%d rows x %d cols)", out_path, len(df), len(df.columns))
+    del df
+    gc.collect()
+    logger.info("Done.")

@@ -219,7 +219,7 @@ def build_debit_features(df: pd.DataFrame) -> pd.DataFrame:
     pd.DataFrame
         df con columnas derivadas añadidas (no elimina las originales).
     """
-    df = df.copy()
+    # No df.copy(): las sub-funciones solo añaden columnas; no se duplica ~1.7 GB
     df = _pagos_features(df)
     df = _gestiones_features(df)
     df = _moras_features(df)
@@ -262,16 +262,23 @@ def select_feature_columns(df: pd.DataFrame) -> list[str]:
     exclude = set(JOIN_KEYS) | {TARGET_COL}
     candidates = [c for c in df.columns if c not in exclude]
 
-    # Varianza cero — columnas constantes
-    variances = df[candidates].var(numeric_only=True)
-    zero_var = variances[variances == 0].index.tolist()
+    # Varianza cero — procesado en chunks de 500 cols para limitar memoria
+    _CHUNK = 500
+    zero_var: list[str] = []
+    for i in range(0, len(candidates), _CHUNK):
+        chunk = candidates[i:i + _CHUNK]
+        v = df[chunk].var(numeric_only=True)
+        zero_var.extend(v[v == 0].index.tolist())
     if zero_var:
         logger.info("Eliminando %d columnas con varianza cero", len(zero_var))
     candidates = [c for c in candidates if c not in zero_var]
 
     # Sparsity > 99% — columnas casi siempre en cero (mayoría de canales individuales)
-    sparsity = (df[candidates] == 0).mean()
-    too_sparse = sparsity[sparsity > 0.99].index.tolist()
+    too_sparse: list[str] = []
+    for i in range(0, len(candidates), _CHUNK):
+        chunk = candidates[i:i + _CHUNK]
+        sp = (df[chunk] == 0).mean()
+        too_sparse.extend(sp[sp > 0.99].index.tolist())
     if too_sparse:
         logger.info("Eliminando %d columnas con >99%% ceros", len(too_sparse))
     candidates = [c for c in candidates if c not in too_sparse]
@@ -311,6 +318,7 @@ def get_feature_matrix(
 # ─── Entrypoint pipeline ─────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import gc
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     parser = argparse.ArgumentParser(
@@ -320,7 +328,9 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", required=True, help="Directory to write split parquets")
     args = parser.parse_args()
 
-    from src.dataset.data_preparation import split_train_test_oot
+    from src.dataset.data_preparation import (
+        TRAIN_END, TEST_START, TEST_END, OOT_START, TARGET_COL as _TARGET, split_train_test_oot,
+    )
 
     logger.info("Cargando modelo analítico desde %s", args.input)
     df = pd.read_parquet(args.input)
@@ -331,21 +341,36 @@ if __name__ == "__main__":
     feature_cols = select_feature_columns(df)
     logger.info("Features seleccionadas: %d columnas", len(feature_cols))
 
-    df_train, df_test, df_oot = split_train_test_oot(df)
-
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
     save_cols = list(dict.fromkeys(JOIN_KEYS + [TARGET_COL] + feature_cols))
 
-    df_train[save_cols].to_parquet(output / "train.parquet", index=False)
-    df_test[save_cols].to_parquet(output / "test.parquet", index=False)
-    df_oot[save_cols].to_parquet(output / "oot.parquet", index=False)
+    # Reducir df a save_cols antes del split para minimizar memoria en los slices
+    df = df[save_cols]
+    gc.collect()
+
+    # Splits secuenciales: nunca más de un split + df en memoria al mismo tiempo
+    f = df["f_analisis"]
+    splits = {
+        "train": df[f <= TRAIN_END],
+        "test":  df[(f >= TEST_START) & (f <= TEST_END)],
+        "oot":   df[f >= OOT_START],
+    }
+    counts: dict[str, int] = {}
+    for name, part in splits.items():
+        counts[name] = len(part)
+        part.to_parquet(output / f"{name}.parquet", index=False)
+        logger.info("Guardado %s.parquet: %d filas", name, len(part))
+        gc.collect()
+
+    del df, splits, f
+    gc.collect()
 
     with open(output / "feature_cols.json", "w") as fh:
         json.dump(feature_cols, fh, indent=2)
 
     logger.info(
         "Splits guardados: train=%d, test=%d, oot=%d | features=%d",
-        len(df_train), len(df_test), len(df_oot), len(feature_cols),
+        counts["train"], counts["test"], counts["oot"], len(feature_cols),
     )
