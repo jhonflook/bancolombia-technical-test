@@ -17,3 +17,5 @@ figures/*
 # Ignore all .png files
 *.png
 *.jpg
+
+data/artifacts/*

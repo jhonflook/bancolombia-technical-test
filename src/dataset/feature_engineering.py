@@ -15,6 +15,7 @@ valores representan el comportamiento pasado, no el evento que genera var_rta.
 """
 
 import argparse
+import gc
 import json
 import logging
 from pathlib import Path
@@ -258,33 +259,43 @@ def select_feature_columns(df: pd.DataFrame) -> list[str]:
     -----
     S10: canales tiene ~4252 features; el filtro de varianza y sparsity
          elimina la mayoría de las columnas ruidosas sin información.
+    Implementación: pasada única por chunk usando numpy float32 para
+    calcular varianza y sparsity simultáneamente. Evita crear dos
+    DataFrames intermedios por chunk y reduce el pico de memoria a
+    ~200 MB por iteración frente a ~500 MB del enfoque anterior.
     """
     exclude = set(JOIN_KEYS) | {TARGET_COL}
     candidates = [c for c in df.columns if c not in exclude]
 
-    # Varianza cero — procesado en chunks de 500 cols para limitar memoria
-    _CHUNK = 500
-    zero_var: list[str] = []
+    # Pasada única: varianza y sparsity en el mismo bloque numpy
+    _CHUNK = 1000  # 1000 cols × 46 736 filas × float32 ≈ 178 MB por chunk
+    keep: list[str] = []
+    removed_var = 0
+    removed_sparse = 0
+
     for i in range(0, len(candidates), _CHUNK):
         chunk = candidates[i:i + _CHUNK]
-        v = df[chunk].var(numeric_only=True)
-        zero_var.extend(v[v == 0].index.tolist())
-    if zero_var:
-        logger.info("Eliminando %d columnas con varianza cero", len(zero_var))
-    candidates = [c for c in candidates if c not in zero_var]
+        # to_numpy(float32) evita copiar el DataFrame completo como objeto pandas
+        arr = df[chunk].to_numpy(dtype=np.float32, na_value=0.0)
+        var_vals = np.var(arr, axis=0)
+        sparse_vals = (arr == 0).mean(axis=0)
+        del arr
 
-    # Sparsity > 99% — columnas casi siempre en cero (mayoría de canales individuales)
-    too_sparse: list[str] = []
-    for i in range(0, len(candidates), _CHUNK):
-        chunk = candidates[i:i + _CHUNK]
-        sp = (df[chunk] == 0).mean()
-        too_sparse.extend(sp[sp > 0.99].index.tolist())
-    if too_sparse:
-        logger.info("Eliminando %d columnas con >99%% ceros", len(too_sparse))
-    candidates = [c for c in candidates if c not in too_sparse]
+        for col, v, s in zip(chunk, var_vals, sparse_vals):
+            if v == 0.0:
+                removed_var += 1
+            elif s > 0.99:
+                removed_sparse += 1
+            else:
+                keep.append(col)
 
-    logger.info("Features seleccionadas: %d", len(candidates))
-    return candidates
+        gc.collect()
+
+    logger.info(
+        "Eliminando %d varianza-cero + %d >99%% ceros → %d features seleccionadas",
+        removed_var, removed_sparse, len(keep),
+    )
+    return keep
 
 
 def get_feature_matrix(
@@ -318,7 +329,9 @@ def get_feature_matrix(
 # ─── Entrypoint pipeline ─────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import gc
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     parser = argparse.ArgumentParser(
@@ -333,7 +346,22 @@ if __name__ == "__main__":
     )
 
     logger.info("Cargando modelo analítico desde %s", args.input)
-    df = pd.read_parquet(args.input)
+    # Leer via pyarrow y castear float64 → float32 ANTES de convertir a pandas.
+    # Sin este paso: pico Arrow(float64) + pandas(float64) ≈ 2.2 GB → OOM.
+    # Con cast en Arrow: pico ≈ 1.65 GB → encaja en los 2.9 GB disponibles.
+    _tbl = pq.read_table(args.input)
+    _new_schema = pa.schema([
+        f.with_type(pa.float32()) if f.type == pa.float64() else f
+        for f in _tbl.schema
+    ])
+    _tbl = _tbl.cast(_new_schema)
+    df = _tbl.to_pandas()
+    del _tbl
+    gc.collect()
+    logger.info(
+        "Parquet cargado como float32: %d filas x %d cols | %.2f GB",
+        len(df), len(df.columns), df.memory_usage(deep=False).sum() / 1024**3,
+    )
 
     logger.info("Construyendo features derivadas...")
     df = build_debit_features(df)
