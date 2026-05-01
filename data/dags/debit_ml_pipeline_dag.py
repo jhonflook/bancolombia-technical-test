@@ -154,6 +154,8 @@ with DAG(
     # Lee analytical_model.parquet, construye features derivadas (exclusividad
     # de canal, recurrencia de débito, ratios de gestiones, coeficientes de mora,
     # indicadores de excedente) y guarda los splits temporales definidos en S7.
+    # Salidas: train.parquet, test.parquet, oot.parquet con TODAS las features
+    # candidatas (base + derivadas, ~240 cols). feature_cols.json se genera en T3.5.
     build_features = DockerOperator(
         task_id="build_features",
         image=IMAGE,
@@ -171,8 +173,35 @@ with DAG(
         doc_md=(
             "Aplica feature engineering y split Train/Test/OOT (S7): "
             "Train 2024-07 → 2025-02, Test 2025-03 → 2025-07, OOT 2025-08 → 2025-11. "
-            "Filtros S10: varianza cero y sparsity > 99%%. "
-            "Salidas: train.parquet, test.parquet, oot.parquet, feature_cols.json."
+            "Guarda todas las features candidatas (~240 cols) sin filtrar. "
+            "Salidas: train.parquet, test.parquet, oot.parquet."
+        ),
+    )
+
+    # ── T3.5: Selección supervisada de features ───────────────────────────
+    # Pipeline de selección en 3 pasos ajustados SOLO sobre train.parquet
+    # (anti-leakage): varianza/sparsity → ANOVA F-test → ElasticNet.
+    # Genera feature_cols.json que consume T4 para entrenamiento.
+    select_features = DockerOperator(
+        task_id="select_features",
+        image=IMAGE,
+        command=(
+            "uv run python -m src.dataset.feature_selection "
+            "--train-path /app/data/artifacts/train.parquet "
+            "--output-dir /app/data/artifacts"
+        ),
+        docker_url=DOCKER_URL,
+        network_mode=NETWORK,
+        environment=CONTAINER_ENV,
+        mounts=[ARTIFACTS_MOUNT],
+        auto_remove="force",
+        mount_tmp_dir=False,
+        doc_md=(
+            "Selección supervisada de features (fit solo en train, anti-leakage): "
+            "1. Filtro varianza cero + sparsity >= 99%%. "
+            "2. ANOVA F-test: top 80%% por F-score univariado. "
+            "3. ElasticNet (l1_ratio=0.7, C=0.1): elimina features con coef=0. "
+            "Salida: data/artifacts/feature_cols.json."
         ),
     )
 
@@ -237,6 +266,7 @@ with DAG(
         >> load_data
         >> build_analytical_model
         >> build_features
+        >> select_features
         >> train_model
         >> provision_metabase
     )

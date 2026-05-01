@@ -16,7 +16,6 @@ valores representan el comportamiento pasado, no el evento que genera var_rta.
 
 import argparse
 import gc
-import json
 import logging
 from pathlib import Path
 
@@ -191,7 +190,6 @@ def _canales_features(df: pd.DataFrame) -> pd.DataFrame:
          de resumen aquí; selección fina se aplica en select_feature_columns().
     """
     trx_cnt = df.get("trx_cnt_total", pd.Series(0.0, index=df.index)).fillna(0.0)
-    trx_mnt = df.get("trx_mnt_total", pd.Series(0.0, index=df.index)).fillna(0.0)
 
     # Flag: tiene actividad transaccional registrada en canales
     df["has_trx_canales"] = (trx_cnt > 0).astype(np.int8)
@@ -342,8 +340,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     from src.dataset.data_preparation import (
-        TRAIN_END, TEST_START, TEST_END, OOT_START, TARGET_COL as _TARGET, split_train_test_oot,
+        TRAIN_END, TEST_START, TEST_END, OOT_START,
     )
+    from src.dataset.feature_config import DEFAULT_FEATURE_CONFIG
 
     logger.info("Cargando modelo analítico desde %s", args.input)
     # Leer via pyarrow y castear float64 → float32 ANTES de convertir a pandas.
@@ -366,17 +365,22 @@ if __name__ == "__main__":
     logger.info("Construyendo features derivadas...")
     df = build_debit_features(df)
 
-    feature_cols = select_feature_columns(df)
-    logger.info("Features seleccionadas: %d columnas", len(feature_cols))
-
-    output = Path(args.output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-
-    save_cols = list(dict.fromkeys(JOIN_KEYS + [TARGET_COL] + feature_cols))
+    # Guardar todas las features candidatas definidas en el config (base + derivadas).
+    # La selección supervisada (varianza → ANOVA → ElasticNet) se hace en el paso
+    # siguiente: src.dataset.feature_selection, que ajusta SOLO sobre train.
+    cfg_features = [c for c in DEFAULT_FEATURE_CONFIG.all_features() if c in df.columns]
+    save_cols = list(dict.fromkeys(JOIN_KEYS + [TARGET_COL] + cfg_features))
 
     # Reducir df a save_cols antes del split para minimizar memoria en los slices
     df = df[save_cols]
     gc.collect()
+    logger.info(
+        "Features candidatas a guardar: %d columnas (selección supervisada pendiente)",
+        len(cfg_features),
+    )
+
+    output = Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
 
     # Splits secuenciales: nunca más de un split + df en memoria al mismo tiempo
     f = df["f_analisis"]
@@ -395,10 +399,8 @@ if __name__ == "__main__":
     del df, splits, f
     gc.collect()
 
-    with open(output / "feature_cols.json", "w") as fh:
-        json.dump(feature_cols, fh, indent=2)
-
     logger.info(
-        "Splits guardados: train=%d, test=%d, oot=%d | features=%d",
-        counts["train"], counts["test"], counts["oot"], len(feature_cols),
+        "Splits guardados: train=%d, test=%d, oot=%d | %d features candidatas "
+        "→ ejecutar feature_selection para generar feature_cols.json",
+        counts["train"], counts["test"], counts["oot"], len(cfg_features),
     )
