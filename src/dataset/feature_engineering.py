@@ -159,10 +159,18 @@ def _excedentes_features(df: pd.DataFrame) -> pd.DataFrame:
     -------
     pd.DataFrame
     """
+    # Cap para porc_pago: cuota=0 con pago>0 produce inf (división por cero en fuente).
+    # 10.0 = 1000% de la cuota; preserva la señal ordinal sin distorsionar el modelo.
+    _PCT_CAP = 10.0
+
     idx = df.index
     for w in WINDOWS:
         exc = df.get(f"avg_excedente_pago_{w}", pd.Series(0.0, index=idx)).fillna(0.0)
-        pct = df.get(f"avg_porc_pago_{w}", pd.Series(0.0, index=idx)).fillna(0.0)
+        pct = df.get(f"avg_porc_pago_{w}", pd.Series(0.0, index=idx)).fillna(0.0).clip(upper=_PCT_CAP)
+
+        df[f"avg_porc_pago_{w}"] = pct
+        if f"max_porc_pago_{w}" in df.columns:
+            df[f"max_porc_pago_{w}"] = df[f"max_porc_pago_{w}"].fillna(0.0).clip(upper=_PCT_CAP)
 
         df[f"has_excedente_{w}"] = (exc > 0).astype(np.int8)
         # Monto de sobrepago relativo: >1 => paga más que la cuota => buen pagador

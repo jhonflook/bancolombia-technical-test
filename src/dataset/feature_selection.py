@@ -71,14 +71,14 @@ def filter_low_variance(
     Notes
     -----
     Procesado en bloques de _CHUNK columnas para controlar uso de memoria
-    (~90 MB por bloque con 22,000 filas en float32).
+    (~180 MB por bloque con 22,000 filas en float64).
     """
     keep: list[str] = []
     removed_var = removed_sparse = 0
 
     for i in range(0, len(candidates), _CHUNK):
         chunk = candidates[i : i + _CHUNK]
-        arr = df_train[chunk].fillna(0.0).to_numpy(dtype=np.float32)
+        arr = df_train[chunk].fillna(0.0).to_numpy(dtype=np.float64)
         var_vals    = np.var(arr, axis=0)
         sparse_vals = (arr == 0).mean(axis=0)
         del arr
@@ -182,7 +182,7 @@ def select_elasticnet(
         max_iter=max_iter,
         random_state=random_state,
         class_weight="balanced",
-        n_jobs=-1,
+        # n_jobs=-1,
     )
     lr.fit(X_scaled, y)
 
@@ -240,7 +240,8 @@ def run_feature_selection(
     step1 = filter_low_variance(df_train, all_cands, var_threshold=var_threshold)
 
     # Construir X con las candidatas post-paso 1
-    X1 = df_train[step1].fillna(0.0).to_numpy(dtype=np.float32)
+    X1 = df_train[step1].fillna(0.0).to_numpy(dtype=np.float64)
+    X1 = np.nan_to_num(X1, nan=0.0, posinf=0.0, neginf=0.0)
     logger.info(
         "Matriz X (paso 1→2): %d × %d (%.1f MB)",
         X1.shape[0], X1.shape[1], X1.nbytes / 1024**2,
@@ -251,7 +252,8 @@ def run_feature_selection(
     del X1
 
     # Reconstruir X con las candidatas post-paso 2
-    X2 = df_train[step2].fillna(0.0).to_numpy(dtype=np.float32)
+    X2 = df_train[step2].fillna(0.0).to_numpy(dtype=np.float64)
+    X2 = np.nan_to_num(X2, nan=0.0, posinf=0.0, neginf=0.0)
     logger.info(
         "Matriz X (paso 2→3): %d × %d (%.1f MB)",
         X2.shape[0], X2.shape[1], X2.nbytes / 1024**2,

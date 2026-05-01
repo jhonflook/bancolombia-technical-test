@@ -57,7 +57,7 @@ class LogisticRegressionDebitClassifier(BaseDebitClassifier):
             max_iter=max_iter,
             class_weight=class_weight,
             random_state=42,
-            n_jobs=-1,
+            # n_jobs=-1,
         )
 
     def get_hyperparameter_space(self, trial: optuna.Trial) -> dict[str, Any]:

@@ -19,3 +19,4 @@ figures/*
 *.jpg
 
 data/artifacts/*
+CLAUDE_backup.md
