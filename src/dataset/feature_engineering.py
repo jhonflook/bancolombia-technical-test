@@ -333,32 +333,60 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     parser = argparse.ArgumentParser(
-        description="Build debit feature matrix: apply engineering + temporal split."
+        description="Build debit feature matrix: apply engineering + split."
     )
     parser.add_argument("--input", required=True, help="Path to analytical_model.parquet")
     parser.add_argument("--output-dir", required=True, help="Directory to write split parquets")
+    parser.add_argument(
+        "--split-strategy",
+        default="temporal",
+        choices=["temporal", "random"],
+        help=(
+            "Estrategia de split: "
+            "'temporal' (default, S7 — por f_analisis) o "
+            "'random' (aleatorio estratificado, para diagnóstico AUC=1)"
+        ),
+    )
+    parser.add_argument(
+        "--random-state",
+        type=int,
+        default=42,
+        help="Semilla para split aleatorio (solo aplica con --split-strategy random)",
+    )
+    parser.add_argument(
+        "--train-size",
+        type=float,
+        default=0.477,
+        help="Fracción para Train en split aleatorio (default 0.477 ≈ split temporal)",
+    )
+    parser.add_argument(
+        "--test-size",
+        type=float,
+        default=0.293,
+        help="Fracción para Test en split aleatorio (default 0.293 ≈ split temporal)",
+    )
     args = parser.parse_args()
 
-    from src.dataset.data_preparation import (
-        TRAIN_END, TEST_START, TEST_END, OOT_START,
-    )
     from src.dataset.feature_config import DEFAULT_FEATURE_CONFIG
+    from src.dataset.split_strategies import apply_split
 
     logger.info("Cargando modelo analítico desde %s", args.input)
-    # Leer via pyarrow y castear float64 → float32 ANTES de convertir a pandas.
-    # Sin este paso: pico Arrow(float64) + pandas(float64) ≈ 2.2 GB → OOM.
-    # Con cast en Arrow: pico ≈ 1.65 GB → encaja en los 2.9 GB disponibles.
+    # Cast float64 → float32 comentado temporalmente (2026-05-01):
+    # produce inf para montos grandes en COP que exceden el rango float32 (~3.4e38),
+    # lo que rompe sklearn en feature_selection cuando el split aleatorio incluye esas filas en train.
+    # Pendiente: decidir estrategia definitiva (clip de valores, float64 con más RAM, o columnas excluidas).
+    # Sin este paso: pico Arrow(float64) + pandas(float64) ≈ 2.2 GB → OOM si la RAM es < 3 GB.
     _tbl = pq.read_table(args.input)
-    _new_schema = pa.schema([
-        f.with_type(pa.float32()) if f.type == pa.float64() else f
-        for f in _tbl.schema
-    ])
-    _tbl = _tbl.cast(_new_schema)
+    # _new_schema = pa.schema([
+    #     f.with_type(pa.float32()) if f.type == pa.float64() else f
+    #     for f in _tbl.schema
+    # ])
+    # _tbl = _tbl.cast(_new_schema)
     df = _tbl.to_pandas()
     del _tbl
     gc.collect()
     logger.info(
-        "Parquet cargado como float32: %d filas x %d cols | %.2f GB",
+        "Parquet cargado como float64: %d filas x %d cols | %.2f GB",
         len(df), len(df.columns), df.memory_usage(deep=False).sum() / 1024**3,
     )
 
@@ -382,25 +410,33 @@ if __name__ == "__main__":
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
-    # Splits secuenciales: nunca más de un split + df en memoria al mismo tiempo
-    f = df["f_analisis"]
-    splits = {
-        "train": df[f <= TRAIN_END],
-        "test":  df[(f >= TEST_START) & (f <= TEST_END)],
-        "oot":   df[f >= OOT_START],
-    }
+    # Aplicar estrategia de split elegida
+    split_kwargs: dict = {}
+    if args.split_strategy == "random":
+        split_kwargs = {
+            "random_state": args.random_state,
+            "train_size":   args.train_size,
+            "test_size":    args.test_size,
+        }
+    logger.info("Estrategia de split: %s %s", args.split_strategy, split_kwargs or "")
+
+    df_train, df_test, df_oot = apply_split(df, strategy=args.split_strategy, **split_kwargs)
+    del df
+    gc.collect()
+
     counts: dict[str, int] = {}
-    for name, part in splits.items():
+    for name, part in (("train", df_train), ("test", df_test), ("oot", df_oot)):
         counts[name] = len(part)
         part.to_parquet(output / f"{name}.parquet", index=False)
         logger.info("Guardado %s.parquet: %d filas", name, len(part))
+        del part
         gc.collect()
 
-    del df, splits, f
+    del df_train, df_test, df_oot
     gc.collect()
 
     logger.info(
-        "Splits guardados: train=%d, test=%d, oot=%d | %d features candidatas "
+        "Splits guardados: train=%d, test=%d, oot=%d | estrategia=%s | %d features candidatas "
         "→ ejecutar feature_selection para generar feature_cols.json",
-        counts["train"], counts["test"], counts["oot"], len(cfg_features),
+        counts["train"], counts["test"], counts["oot"], args.split_strategy, len(cfg_features),
     )

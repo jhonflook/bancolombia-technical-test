@@ -3,13 +3,32 @@
 Entrenamiento y comparación de clasificadores de débitos recurrentes.
 
 Entrena múltiples clasificadores del MODEL_REGISTRY con optimización de
-hiperparámetros vía Optuna, evalúa en Train / Test / OOT y registra el
-mejor modelo en MLflow.
+hiperparámetros vía Optuna. Estructura de runs MLflow:
+
+  debit-models  (experimento MLflow)
+  └── debit-models  (run padre — agrupa la comparación)
+      ├── xgboost            ← run hijo anidado (nested=True)
+      ├── random_forest      ← ídem
+      └── gradient_boosting  ← ídem
+
+Métricas con evolución temporal (step-based) por run hijo:
+  cv_trial_auc   @ step=número de trial Optuna  → curva de optimización
+  cv_fold_auc/ks/f1 @ step=0..4                 → estabilidad CV por fold
+  evolution_auc_roc/ks/f1_05/auc_pr @ step=0(train)/1(test)/2(oot) → degradación
+
+Figuras logueadas como artefactos (visibles en pestaña Artifacts de MLflow):
+  figures/roc_curve.png           → curvas ROC train/test/oot superpuestas
+  figures/pr_curve.png            → curvas Precision-Recall train/test/oot
+  figures/feature_importance.png  → top-20 features por importancia
+  figures/optuna_history.png      → evolución AUC por trial Optuna (si n_trials>0)
+
+Métricas escalares por run hijo (para filtrado en MLflow):
+  cv_auc, train_*, test_*, oot_*
 
 Uso:
     uv run python deploy/train_debit_classifier.py --data-dir data/artifacts
     uv run python deploy/train_debit_classifier.py --models xgboost random_forest
-    uv run python deploy/train_debit_classifier.py --models xgboost --n-trials 50
+    uv run python deploy/train_debit_classifier.py --models xgboost --n-trials 10
     uv run python deploy/train_debit_classifier.py --models logistic_regression --n-trials 0
 
 Modelos disponibles: xgboost, random_forest, gradient_boosting, logistic_regression
@@ -20,21 +39,51 @@ import argparse
 import json
 import logging
 import pickle
+import tempfile
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")  # backend sin pantalla para entornos headless
+import matplotlib.pyplot as plt
 import mlflow
 import optuna
 import pandas as pd
+from sklearn.metrics import (
+    auc as sklearn_auc,
+    precision_recall_curve,
+    roc_auc_score,
+    roc_curve,
+)
 
 from src.statistical_models import DEFAULT_MODELS, MODEL_REGISTRY
-from src.statistical_models.evaluation import compute_classification_metrics, evaluate_classifier_cv
+from src.statistical_models.evaluation import (
+    CVResults,
+    compute_classification_metrics,
+    evaluate_classifier_cv,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-EXPERIMENT_NAME = "debit_recurrence_classifier"
+EXPERIMENT_NAME = "debit-models"
 TARGET_COL = "var_rta"
+
+# Orden fijo de particiones para métricas de evolución (step=0,1,2)
+PARTITION_STEPS = {"train": 0, "test": 1, "oot": 2}
+
+# Métricas que se grafican como evolución Train→Test→OOT
+EVOLUTION_METRICS = [
+    "auc_roc", "ks", "f1_05", "auc_pr",
+    "precision_05", "recall_05", "precision_ks", "recall_ks", "f1_ks",
+]
+
+# Colores por partición para figuras
+_PARTITION_COLORS = {
+    "train": "royalblue",
+    "test":  "darkorange",
+    "oot":   "forestgreen",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,13 +99,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mlflow-uri",
         default="http://localhost:5000",
-        help="URI del servidor MLflow",
+        help="URI del servidor MLflow (default: http://localhost:5000; "
+             "usar http://mlflow:5000 dentro de la red Docker)",
     )
     parser.add_argument(
         "--n-trials",
         type=int,
-        default=30,
-        help="Trials Optuna por modelo (0 = solo parámetros por defecto)",
+        default=5,
+        help="Trials Optuna por modelo (0 = solo parámetros por defecto, sí corre 1 CV)",
     )
     parser.add_argument(
         "--models",
@@ -66,6 +116,17 @@ def parse_args() -> argparse.Namespace:
         help=(
             f"Modelos a entrenar. Disponibles: {', '.join(MODEL_REGISTRY.keys())}. "
             f"Default: {', '.join(DEFAULT_MODELS)}"
+        ),
+    )
+    parser.add_argument(
+        "--split-strategy",
+        default="temporal",
+        choices=["temporal", "random"],
+        help=(
+            "Estrategia usada para generar los parquets de entrada. "
+            "Solo se loguea en MLflow; no altera la carga de datos. "
+            "Debe coincidir con el --split-strategy usado en feature_engineering. "
+            "Default: 'temporal'"
         ),
     )
     return parser.parse_args()
@@ -85,35 +146,30 @@ def optimize_hyperparams(
     feature_cols: list[str],
     n_trials: int,
     scale_pos_weight: float,
-) -> dict:
-    """Optimizar hiperparámetros de un clasificador con Optuna.
-
-    Usa validación cruzada estratificada (5 folds) sobre el conjunto de
-    entrenamiento. La métrica de optimización es AUC-ROC medio (S8).
+) -> tuple[dict, float, list[tuple[int, float]], CVResults | None]:
+    """Optimizar hiperparámetros con Optuna y capturar historial de trials.
 
     Parameters
     ----------
     model_name : str
-        Clave en MODEL_REGISTRY.
     X_train : pd.DataFrame
-        Features de entrenamiento.
     y_train : pd.Series
-        Target binario de entrenamiento.
     feature_cols : list[str]
-        Features seleccionados.
     n_trials : int
-        Número de trials Optuna.
     scale_pos_weight : float
-        Cociente n_neg/n_pos para corrección de desbalance.
 
     Returns
     -------
-    dict
-        Mejores hiperparámetros encontrados.
+    tuple[dict, float, list[tuple[int, float]], CVResults | None]
+        (mejores params, mejor AUC CV, historial [(trial_num, auc)], CVResults del mejor trial)
     """
     model_class = MODEL_REGISTRY[model_name]
+    trial_history: list[tuple[int, float]] = []
+    best_cv_results: CVResults | None = None
+    best_auc_so_far = -1.0
 
     def objective(trial: optuna.Trial) -> float:
+        nonlocal best_cv_results, best_auc_so_far
         params = model_class().get_hyperparameter_space(trial)
         cv = evaluate_classifier_cv(
             model_class=model_class,
@@ -124,6 +180,10 @@ def optimize_hyperparams(
             n_splits=5,
             scale_pos_weight=scale_pos_weight,
         )
+        trial_history.append((trial.number, cv.mean_auc))
+        if cv.mean_auc > best_auc_so_far:
+            best_auc_so_far = cv.mean_auc
+            best_cv_results = cv
         return cv.mean_auc
 
     study = optuna.create_study(direction="maximize", study_name=f"debit_{model_name}")
@@ -133,7 +193,7 @@ def optimize_hyperparams(
         "[%s] Optuna completado | best_cv_auc=%.4f | params=%s",
         model_name, study.best_value, study.best_params,
     )
-    return study.best_params
+    return study.best_params, study.best_value, trial_history, best_cv_results
 
 
 def train_and_evaluate(
@@ -151,26 +211,18 @@ def train_and_evaluate(
     Parameters
     ----------
     model_name : str
-        Clave en MODEL_REGISTRY.
     df_train : pd.DataFrame
-        Partición de entrenamiento (S7).
     df_test : pd.DataFrame
-        Partición de test (S7).
     df_oot : pd.DataFrame
-        Partición OOT — out-of-time (S7).
     feature_cols : list[str]
-        Features seleccionados.
     best_params : dict
-        Hiperparámetros optimizados (o vacío si n_trials=0).
     scale_pos_weight : float
-        Cociente n_neg/n_pos para corrección de desbalance (S8).
     data_path : Path
-        Directorio donde se guarda el artefacto pkl.
 
     Returns
     -------
     dict
-        Diccionario con 'model', 'metrics', 'artifact_path', 'test_auc'.
+        Claves: model, metrics, artifact_path, test_auc, importances
     """
     model_class = MODEL_REGISTRY[model_name]
     clf = model_class()
@@ -208,16 +260,254 @@ def train_and_evaluate(
         "metrics":       all_metrics,
         "artifact_path": artifact_path,
         "test_auc":      all_metrics["test_auc_roc"],
+        "importances":   clf.get_feature_importances(),
     }
 
 
+def _log_figures(
+    clf,
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
+    df_oot: pd.DataFrame,
+    feature_cols: list[str],
+    model_name: str,
+    importances: dict | None,
+    trial_history: list[tuple[int, float]],
+) -> None:
+    """Loguear figuras matplotlib como artefactos en el run MLflow activo.
+
+    Genera y sube:
+    - ROC curves superpuestas (train/test/oot)
+    - Precision-Recall curves superpuestas (train/test/oot)
+    - Feature importance bar chart (top 20)
+    - Optuna optimization history (si trial_history no está vacío)
+
+    Cada figura se envuelve en try/except para no interrumpir el run.
+    """
+    partitions = [
+        ("train", df_train),
+        ("test",  df_test),
+        ("oot",   df_oot),
+    ]
+
+    # ── ROC curves ───────────────────────────────────────────────────────────
+    try:
+        fig, ax = plt.subplots(figsize=(7, 6))
+        for pname, df_p in partitions:
+            y_true = df_p[TARGET_COL].astype(int).values
+            y_prob = clf.predict_proba(df_p[feature_cols].fillna(0.0))
+            fpr, tpr, _ = roc_curve(y_true, y_prob)
+            auc_val = roc_auc_score(y_true, y_prob)
+            ax.plot(fpr, tpr, label=f"{pname} (AUC={auc_val:.3f})",
+                    color=_PARTITION_COLORS[pname], linewidth=2)
+        ax.plot([0, 1], [0, 1], "k--", alpha=0.4, linewidth=1)
+        ax.set_xlabel("False Positive Rate")
+        ax.set_ylabel("True Positive Rate")
+        ax.set_title(f"ROC Curve — {model_name}")
+        ax.legend(loc="lower right")
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        mlflow.log_figure(fig, "figures/roc_curve.png")
+        plt.close(fig)
+    except Exception as exc:
+        logger.warning("[%s] No se pudo loguear ROC curve: %s", model_name, exc)
+
+    # ── Precision-Recall curves ──────────────────────────────────────────────
+    try:
+        fig, ax = plt.subplots(figsize=(7, 6))
+        for pname, df_p in partitions:
+            y_true = df_p[TARGET_COL].astype(int).values
+            y_prob = clf.predict_proba(df_p[feature_cols].fillna(0.0))
+            prec, rec, _ = precision_recall_curve(y_true, y_prob)
+            auc_pr = float(sklearn_auc(rec, prec))
+            ax.plot(rec, prec, label=f"{pname} (AUC-PR={auc_pr:.3f})",
+                    color=_PARTITION_COLORS[pname], linewidth=2)
+        ax.set_xlabel("Recall")
+        ax.set_ylabel("Precision")
+        ax.set_title(f"Precision-Recall Curve — {model_name}")
+        ax.legend(loc="lower left")
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        mlflow.log_figure(fig, "figures/pr_curve.png")
+        plt.close(fig)
+    except Exception as exc:
+        logger.warning("[%s] No se pudo loguear PR curve: %s", model_name, exc)
+
+    # ── Feature importance (top 20) ──────────────────────────────────────────
+    if importances:
+        try:
+            sorted_imp = sorted(importances.items(), key=lambda x: x[1], reverse=True)[:20]
+            names = [x[0] for x in sorted_imp]
+            vals  = [x[1] for x in sorted_imp]
+            fig, ax = plt.subplots(figsize=(10, 8))
+            ax.barh(names[::-1], vals[::-1], color="steelblue", edgecolor="white")
+            ax.set_xlabel("Importance")
+            ax.set_title(f"Feature Importance (Top 20) — {model_name}")
+            ax.grid(axis="x", alpha=0.3)
+            fig.tight_layout()
+            mlflow.log_figure(fig, "figures/feature_importance.png")
+            plt.close(fig)
+        except Exception as exc:
+            logger.warning("[%s] No se pudo loguear feature importance: %s", model_name, exc)
+
+    # ── Optuna optimization history ──────────────────────────────────────────
+    if trial_history:
+        try:
+            trial_nums = [t[0] for t in trial_history]
+            trial_aucs = [t[1] for t in trial_history]
+            best_so_far = [max(trial_aucs[:i + 1]) for i in range(len(trial_aucs))]
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.plot(trial_nums, trial_aucs, "o-", alpha=0.55,
+                    label="CV AUC (trial)", color="steelblue")
+            ax.plot(trial_nums, best_so_far, "r--",
+                    label="Mejor acumulado", linewidth=2)
+            ax.set_xlabel("Trial")
+            ax.set_ylabel("CV AUC (StratifiedKFold 5)")
+            ax.set_title(f"Optuna Optimization History — {model_name}")
+            ax.legend()
+            ax.grid(alpha=0.3)
+            fig.tight_layout()
+            mlflow.log_figure(fig, "figures/optuna_history.png")
+            plt.close(fig)
+        except Exception as exc:
+            logger.warning("[%s] No se pudo loguear Optuna history: %s", model_name, exc)
+
+
+def _log_model_run(
+    model_name: str,
+    best_params: dict,
+    cv_auc: float,
+    result: dict,
+    scale_pos_weight: float,
+    n_features: int,
+    n_trials: int,
+    trial_history: list[tuple[int, float]],
+    cv_fold_results: pd.DataFrame | None,
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
+    df_oot: pd.DataFrame,
+    feature_cols: list[str],
+) -> str:
+    """Registrar run hijo anidado en MLflow para un modelo.
+
+    Loguea dentro de un run activo padre usando nested=True.
+    Incluye evolución por trial Optuna, por fold CV, Train→Test→OOT y figuras.
+
+    Parameters
+    ----------
+    model_name : str
+    best_params : dict
+    cv_auc : float
+    result : dict
+    scale_pos_weight : float
+    n_features : int
+    n_trials : int
+    trial_history : list[tuple[int, float]]
+        [(trial_number, cv_auc), ...] — historial de optimización Optuna.
+    cv_fold_results : pd.DataFrame | None
+        fold_results del mejor trial: columnas fold, auc_roc, ks_stat, f1_05.
+    df_train : pd.DataFrame
+    df_test : pd.DataFrame
+    df_oot : pd.DataFrame
+    feature_cols : list[str]
+
+    Returns
+    -------
+    str
+        run_id del run hijo creado.
+    """
+    with mlflow.start_run(run_name=model_name, nested=True) as run:
+
+        # ── Tags ──────────────────────────────────────────────────────────────
+        mlflow.set_tags({
+            "model_type": model_name,
+            "framework":  "sklearn-compatible",
+        })
+
+        # ── Parámetros ────────────────────────────────────────────────────────
+        mlflow.log_params({
+            "model_type":       model_name,
+            "n_features":       n_features,
+            "n_trials":         n_trials,
+            "scale_pos_weight": round(scale_pos_weight, 4),
+            **{k: round(float(v), 6) if isinstance(v, float) else v
+               for k, v in best_params.items()},
+        })
+
+        # ── CV AUC escalar ────────────────────────────────────────────────────
+        mlflow.log_metric("cv_auc", round(cv_auc, 4))
+
+        # ── Evolución Optuna: AUC por trial (step = número de trial) ─────────
+        for trial_num, trial_auc in trial_history:
+            mlflow.log_metric("cv_trial_auc", round(trial_auc, 4), step=trial_num)
+
+        # ── Evolución CV: métricas por fold (step = fold 0..4) ───────────────
+        if cv_fold_results is not None:
+            for _, row in cv_fold_results.iterrows():
+                step = int(row["fold"])
+                mlflow.log_metric("cv_fold_auc", round(float(row["auc_roc"]), 4), step=step)
+                mlflow.log_metric("cv_fold_ks",  round(float(row["ks_stat"]), 4), step=step)
+                mlflow.log_metric("cv_fold_f1",  round(float(row["f1_05"]),   4), step=step)
+
+        # ── Métricas escalares completas: train / test / OOT ─────────────────
+        mlflow.log_metrics(result["metrics"])
+
+        # ── Evolución particiones Train→Test→OOT (step=0,1,2) ────────────────
+        # Permite graficar curvas de generalización en la UI de MLflow.
+        for partition, step in PARTITION_STEPS.items():
+            for metric in EVOLUTION_METRICS:
+                key = f"{partition}_{metric}"
+                if key in result["metrics"]:
+                    mlflow.log_metric(
+                        f"evolution_{metric}",
+                        result["metrics"][key],
+                        step=step,
+                    )
+
+        # ── Figuras matplotlib como artefactos ───────────────────────────────
+        _log_figures(
+            clf=result["model"],
+            df_train=df_train,
+            df_test=df_test,
+            df_oot=df_oot,
+            feature_cols=feature_cols,
+            model_name=model_name,
+            importances=result["importances"],
+            trial_history=trial_history,
+        )
+
+        # ── Artefacto: modelo pkl ─────────────────────────────────────────────
+        try:
+            mlflow.log_artifact(str(result["artifact_path"]))
+        except Exception as exc:
+            logger.warning("[%s] No se pudo subir el artefacto pkl: %s", model_name, exc)
+
+        # ── Artefacto: feature importances CSV ───────────────────────────────
+        importances = result["importances"]
+        if importances:
+            rows = sorted(importances.items(), key=lambda x: x[1], reverse=True)
+            imp_df = pd.DataFrame(rows, columns=["feature", "importance"])
+            with tempfile.NamedTemporaryFile(
+                suffix=".csv", prefix=f"feature_importance_{model_name}_",
+                delete=False, mode="w",
+            ) as tmp:
+                imp_df.to_csv(tmp.name, index=False)
+                try:
+                    mlflow.log_artifact(tmp.name, artifact_path="feature_importance")
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] No se pudo subir feature_importance.csv: %s", model_name, exc
+                    )
+
+        return run.info.run_id
+
+
 def main() -> None:
-    """Entrypoint principal: carga splits → optimiza → entrena → evalúa → MLflow."""
+    """Entrypoint: carga splits → optimiza → entrena → evalúa → MLflow."""
     args = parse_args()
     model_names = args.models or DEFAULT_MODELS
-    data_path = Path(args.data_dir)
+    data_path   = Path(args.data_dir)
 
-    # Cargar particiones temporales (S7)
     df_train = pd.read_parquet(data_path / "train.parquet")
     df_test  = pd.read_parquet(data_path / "test.parquet")
     df_oot   = pd.read_parquet(data_path / "oot.parquet")
@@ -228,10 +518,11 @@ def main() -> None:
     logger.info("=" * 70)
     logger.info("DEBIT RECURRENCE CLASSIFIER — ENTRENAMIENTO MULTI-MODELO")
     logger.info("=" * 70)
-    logger.info("Modelos:   %s", model_names)
-    logger.info("Features:  %d | train=%d | test=%d | oot=%d",
+    logger.info("Modelos:        %s", model_names)
+    logger.info("Split strategy: %s", args.split_strategy)
+    logger.info("Features:       %d | train=%d | test=%d | oot=%d",
                 len(feature_cols), len(df_train), len(df_test), len(df_oot))
-    logger.info("n_trials:  %d", args.n_trials)
+    logger.info("n_trials:       %d", args.n_trials)
 
     scale_pos_weight = _compute_scale_pos_weight(df_train[TARGET_COL].astype(int))
     logger.info("scale_pos_weight=%.3f  (desbalance S8)", scale_pos_weight)
@@ -239,28 +530,31 @@ def main() -> None:
     mlflow.set_tracking_uri(args.mlflow_uri)
     mlflow.set_experiment(EXPERIMENT_NAME)
 
-    results: dict[str, dict] = {}
+    results:  dict[str, dict]  = {}
+    cv_aucs:  dict[str, float] = {}
+    run_ids:  dict[str, str]   = {}
 
-    with mlflow.start_run(run_name="debit_classifier_comparison") as parent_run:
+    # ── Run padre: agrupa todos los modelos ──────────────────────────────────
+    with mlflow.start_run(run_name="debit-models") as parent_run:
         mlflow.log_params({
-            "models":           ",".join(model_names),
+            "models_compared":  ",".join(model_names),
             "n_trials":         args.n_trials,
             "n_features":       len(feature_cols),
-            "n_train":          len(df_train),
-            "n_test":           len(df_test),
-            "n_oot":            len(df_oot),
+            "train_size":       len(df_train),
+            "test_size":        len(df_test),
+            "oot_size":         len(df_oot),
             "scale_pos_weight": round(scale_pos_weight, 4),
-            "target_col":       TARGET_COL,
+            "split_strategy":   args.split_strategy,
         })
 
+        # ── Un run hijo por modelo (nested=True) ─────────────────────────────
         for model_name in model_names:
             logger.info("=" * 50)
             logger.info("MODELO: %s", model_name.upper())
 
-            with mlflow.start_run(run_name=f"debit_{model_name}", nested=True):
-                # Optimización de hiperparámetros con Optuna
+            try:
                 if args.n_trials > 0:
-                    best_params = optimize_hyperparams(
+                    best_params, cv_auc, trial_history, best_cv = optimize_hyperparams(
                         model_name=model_name,
                         X_train=df_train[feature_cols].fillna(0.0),
                         y_train=df_train[TARGET_COL].astype(int),
@@ -268,12 +562,23 @@ def main() -> None:
                         n_trials=args.n_trials,
                         scale_pos_weight=scale_pos_weight,
                     )
+                    cv_fold_results = best_cv.fold_results if best_cv is not None else None
                 else:
+                    # Sin Optuna: parámetros por defecto + 1 CV para fold metrics
                     best_params = {}
+                    trial_history = []
+                    cv_single = evaluate_classifier_cv(
+                        model_class=MODEL_REGISTRY[model_name],
+                        X=df_train[feature_cols].fillna(0.0),
+                        y=df_train[TARGET_COL].astype(int),
+                        selected_features=feature_cols,
+                        params={},
+                        n_splits=5,
+                        scale_pos_weight=scale_pos_weight,
+                    )
+                    cv_auc = cv_single.mean_auc
+                    cv_fold_results = cv_single.fold_results
 
-                mlflow.log_params({"model_type": model_name, **best_params})
-
-                # Entrenamiento final y evaluación en las 3 particiones
                 result = train_and_evaluate(
                     model_name=model_name,
                     df_train=df_train,
@@ -284,48 +589,88 @@ def main() -> None:
                     scale_pos_weight=scale_pos_weight,
                     data_path=data_path,
                 )
-                results[model_name] = result
+                results[model_name]  = result
+                cv_aucs[model_name]  = cv_auc
+                run_ids[model_name]  = _log_model_run(
+                    model_name=model_name,
+                    best_params=best_params,
+                    cv_auc=cv_auc,
+                    result=result,
+                    scale_pos_weight=scale_pos_weight,
+                    n_features=len(feature_cols),
+                    n_trials=args.n_trials,
+                    trial_history=trial_history,
+                    cv_fold_results=cv_fold_results,
+                    df_train=df_train,
+                    df_test=df_test,
+                    df_oot=df_oot,
+                    feature_cols=feature_cols,
+                )
 
-                mlflow.log_metrics(result["metrics"])
-                mlflow.log_artifact(str(result["artifact_path"]))
+            except Exception as exc:
+                logger.error("[%s] Falló: %s", model_name, exc, exc_info=True)
+                with mlflow.start_run(run_name=model_name, nested=True):
+                    mlflow.set_tag("status", "FAILED")
+                    mlflow.set_tag("error", str(exc)[:250])
 
-                # Importancia de features (si el modelo la expone)
-                importances = result["model"].get_feature_importances()
-                if importances:
-                    top30 = sorted(importances.items(), key=lambda x: x[1], reverse=True)[:30]
-                    mlflow.log_param(
-                        "top_features",
-                        json.dumps({k: round(float(v), 5) for k, v in top30}),
-                    )
+        if not results:
+            logger.error("Ningún modelo completó el entrenamiento.")
+            mlflow.set_tag("status", "ALL_FAILED")
+            return
 
-        # Selección del mejor modelo por AUC-ROC en Test
-        best_name = max(results, key=lambda m: results[m]["test_auc"])
+        # ── Comparación: métricas resumen en el run padre ─────────────────────
+        best_name   = max(results, key=lambda m: results[m]["test_auc"])
         best_result = results[best_name]
 
-        mlflow.log_params({"best_model": best_name})
+        mlflow.log_param("best_model", best_name)
+
+        comparison_metrics: dict[str, float] = {}
+        for name, res in results.items():
+            prefix = name.replace("_", "")
+            comparison_metrics.update({
+                f"{prefix}_cv_auc":    round(cv_aucs[name], 4),
+                f"{prefix}_train_auc": round(res["metrics"]["train_auc_roc"], 4),
+                f"{prefix}_train_ks":  round(res["metrics"]["train_ks"], 4),
+                f"{prefix}_test_auc":  round(res["metrics"]["test_auc_roc"], 4),
+                f"{prefix}_test_ks":   round(res["metrics"]["test_ks"], 4),
+                f"{prefix}_oot_auc":   round(res["metrics"]["oot_auc_roc"], 4),
+                f"{prefix}_oot_ks":    round(res["metrics"]["oot_ks"], 4),
+            })
+        mlflow.log_metrics(comparison_metrics)
+
         mlflow.log_metrics({
-            "best_test_auc_roc": best_result["metrics"]["test_auc_roc"],
-            "best_test_ks":      best_result["metrics"]["test_ks"],
-            "best_oot_auc_roc":  best_result["metrics"]["oot_auc_roc"],
-            "best_oot_ks":       best_result["metrics"]["oot_ks"],
+            "best_cv_auc":    round(cv_aucs[best_name], 4),
+            "best_train_auc": round(best_result["metrics"]["train_auc_roc"], 4),
+            "best_train_ks":  round(best_result["metrics"]["train_ks"], 4),
+            "best_test_auc":  round(best_result["metrics"]["test_auc_roc"], 4),
+            "best_test_ks":   round(best_result["metrics"]["test_ks"], 4),
+            "best_oot_auc":   round(best_result["metrics"]["oot_auc_roc"], 4),
+            "best_oot_ks":    round(best_result["metrics"]["oot_ks"], 4),
         })
 
-        logger.info("=" * 70)
-        logger.info("RESUMEN FINAL")
-        logger.info("=" * 70)
-        for name, res in results.items():
-            marker = "  <-- MEJOR" if name == best_name else ""
-            logger.info(
-                "%-22s Test AUC=%.4f | Test KS=%.4f | OOT AUC=%.4f | OOT KS=%.4f%s",
-                name,
-                res["metrics"]["test_auc_roc"],
-                res["metrics"]["test_ks"],
-                res["metrics"]["oot_auc_roc"],
-                res["metrics"]["oot_ks"],
-                marker,
-            )
-        logger.info("MLflow run_id: %s", parent_run.info.run_id)
-        logger.info("Ver resultados en: %s", args.mlflow_uri)
+    # ── Resumen en log ────────────────────────────────────────────────────────
+    logger.info("=" * 70)
+    logger.info("RESUMEN FINAL")
+    logger.info("=" * 70)
+    logger.info("%-22s %8s %8s %8s %8s %8s %8s",
+                "Modelo", "CV AUC", "Tr AUC", "Tr KS", "Te AUC", "Te KS", "OOT AUC")
+    for name, res in results.items():
+        marker = "  <-- MEJOR" if name == best_name else ""
+        logger.info(
+            "%-22s %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f%s",
+            name,
+            cv_aucs[name],
+            res["metrics"]["train_auc_roc"],
+            res["metrics"]["train_ks"],
+            res["metrics"]["test_auc_roc"],
+            res["metrics"]["test_ks"],
+            res["metrics"]["oot_auc_roc"],
+            marker,
+        )
+    logger.info(
+        "MLflow: %s  |  Experimento: %s  |  Parent run: %s",
+        args.mlflow_uri, EXPERIMENT_NAME, parent_run.info.run_id,
+    )
 
 
 if __name__ == "__main__":

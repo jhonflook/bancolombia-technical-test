@@ -1,15 +1,16 @@
-"""
-Feature selection supervisada para el modelo de débitos recurrentes — Bancolombia.
+"""Feature selection supervisada para el modelo de débitos recurrentes — Bancolombia.
 
-Pipeline en 3 pasos ajustados SOLO sobre el conjunto de entrenamiento:
-  1. Filtro de varianza cero y sparsity extrema (no supervisado)
-  2. ANOVA F-test: retiene el top-percentil por F-score univariado
-  3. ElasticNet: LogisticRegression con penalty L1+L2; elimina features con coef = 0
+Pipeline secuencial en 3 pasos, ajustados SOLO sobre el conjunto de entrenamiento:
+  1. filter_low_variance: var<=0.01 (casi cero) o sparsity>=99% → eliminar (no supervisado).
+  2. select_anova: SelectPercentile(f_classif, percentile=80) → top 80% por F-score.
+  3. select_elasticnet: LogisticRegression(elasticnet, l1_ratio=0.7, C=0.1) → coef != 0.
 
-Anti-leakage: los pasos 2 y 3 hacen fit únicamente sobre train.parquet.
-El feature_cols.json resultante se aplica a test y OOT sin ningún refiteo.
+La salida de cada paso es la entrada del siguiente (reducción progresiva).
 
-Pipeline step (standalone):
+Anti-leakage: todos los pasos supervisados ajustan SOLO sobre train.parquet.
+El feature_cols.json resultante se aplica sin cambios a test y OOT.
+
+Standalone:
     python -m src.dataset.feature_selection \
         --train-path data/artifacts/train.parquet \
         --output-dir data/artifacts
@@ -28,18 +29,18 @@ from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
 
-JOIN_KEYS = ["num_doc", "obl17", "f_analisis"]
+JOIN_KEYS  = ["num_doc", "obl17", "f_analisis"]
 TARGET_COL = "var_rta"
 
 # ─── Parámetros por defecto ───────────────────────────────────────────────────
-_VAR_THRESHOLD    = 0.0   # varianza exactamente cero → eliminar
+_VAR_THRESHOLD    = 0.01  # varianza <= umbral (cero o casi cero) → eliminar
 _SPARSITY_LIMIT   = 0.99  # >= 99% ceros → eliminar
-_ANOVA_PERCENTILE = 80    # top 80% por F-score ANOVA
-_EN_L1_RATIO      = 0.7   # l1_ratio: más hacia L1 para mayor sparsity de coef
-_EN_C             = 0.1   # inverso de regularización: 0.1 = agresivo
+_ANOVA_PERCENTILE = 80    # top-80% por F-score ANOVA
+_EN_L1_RATIO      = 0.7   # mezcla L1/L2 para ElasticNet (1.0 = L1 puro)
+_EN_C             = 0.1   # inverso de regularización (menor = más agresivo)
 _EN_MAX_ITER      = 3000
 _RANDOM_STATE     = 42
-_CHUNK            = 500   # cols por chunk para el filtro de varianza (~90 MB / chunk)
+_CHUNK            = 500   # columnas por bloque en el filtro de varianza
 
 
 # ─── Paso 1: varianza / sparsity ──────────────────────────────────────────────
@@ -50,54 +51,50 @@ def filter_low_variance(
     var_threshold: float = _VAR_THRESHOLD,
     sparsity_limit: float = _SPARSITY_LIMIT,
 ) -> list[str]:
-    """Eliminar features con varianza cero o sparsity extrema.
+    """Eliminar features con varianza cero o casi cero, o sparsity extrema.
 
     Parameters
     ----------
     df_train : pd.DataFrame
-        Partición de entrenamiento.
     candidates : list[str]
-        Nombres de features candidatas (sin JOIN_KEYS ni TARGET_COL).
+        Features candidatas (sin JOIN_KEYS ni TARGET_COL).
     var_threshold : float
-        Umbral mínimo de varianza; features con var <= threshold se eliminan.
+        Features con varianza <= threshold se eliminan (cubre var=0 y casi cero).
+        Default 0.01 — apropiado para features en escala ratio (0–1) y SMMLV.
     sparsity_limit : float
-        Fracción máxima de ceros; features con frac >= limit se eliminan.
+        Features con fracción de ceros >= limit se eliminan.
 
     Returns
     -------
     list[str]
-        Features que superan ambos filtros.
 
     Notes
     -----
-    Procesamiento en chunks de _CHUNK columnas para mantener el pico de
-    memoria por debajo de ~100 MB por iteración con float32.
+    Procesado en bloques de _CHUNK columnas para controlar uso de memoria
+    (~90 MB por bloque con 22,000 filas en float32).
     """
     keep: list[str] = []
     removed_var = removed_sparse = 0
 
     for i in range(0, len(candidates), _CHUNK):
         chunk = candidates[i : i + _CHUNK]
-        arr = df_train[chunk].to_numpy(dtype=np.float32, na_value=0.0)
-        var_vals = np.var(arr, axis=0)
+        arr = df_train[chunk].fillna(0.0).to_numpy(dtype=np.float32)
+        var_vals    = np.var(arr, axis=0)
         sparse_vals = (arr == 0).mean(axis=0)
         del arr
 
         for col, v, s in zip(chunk, var_vals, sparse_vals):
             if v <= var_threshold:
                 removed_var += 1
-            elif s >= sparsity_limit:
+            elif s >= sparsity_limit:  # noqa: SIM114
                 removed_sparse += 1
             else:
                 keep.append(col)
 
     logger.info(
-        "Paso 1 — varianza/sparsity: eliminadas %d (var=0: %d | sparse>=%.0f%%: %d) → %d candidatas",
-        removed_var + removed_sparse,
-        removed_var,
-        sparsity_limit * 100,
-        removed_sparse,
-        len(keep),
+        "Paso 1 — varianza/sparsity: eliminadas %d (var<=%.3f: %d | sparse>=%.0f%%: %d) → %d candidatas",
+        removed_var + removed_sparse, var_threshold, removed_var,
+        sparsity_limit * 100, removed_sparse, len(keep),
     )
     return keep
 
@@ -105,89 +102,78 @@ def filter_low_variance(
 # ─── Paso 2: ANOVA F-test ─────────────────────────────────────────────────────
 
 def select_anova(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
+    X: np.ndarray,
+    y: np.ndarray,
     candidates: list[str],
     percentile: int = _ANOVA_PERCENTILE,
-) -> tuple[list[str], np.ndarray]:
-    """Seleccionar features por ANOVA F-test univariado.
+) -> list[str]:
+    """Seleccionar top-percentil de features por ANOVA F-score univariado.
 
     Parameters
     ----------
-    X_train : np.ndarray
-        Matriz de features del conjunto de entrenamiento (n_samples, n_features).
-    y_train : np.ndarray
-        Vector target binario.
+    X : np.ndarray (n_samples, n_features)
+        Valores de las features en `candidates` (ya filtradas por varianza).
+    y : np.ndarray (n_samples,)
     candidates : list[str]
-        Nombres de features en el mismo orden que las columnas de X_train.
     percentile : int
-        Porcentaje de features a retener ordenadas por F-score descendente.
+        Porcentaje superior a retener (80 → top 80% por F-score).
 
     Returns
     -------
-    tuple[list[str], np.ndarray]
-        (features_seleccionadas, X_filtrado) — X_filtrado ya tiene solo las cols retenidas.
+    list[str]
+        Subset de `candidates` con F-score en el top `percentile`%.
 
     Notes
     -----
-    Fit exclusivo sobre train: SelectPercentile no ve labels de test/OOT.
+    sklearn implementa f_classif en C. Fit exclusivo sobre train.
     """
     selector = SelectPercentile(f_classif, percentile=percentile)
-    X_sel = selector.fit_transform(X_train, y_train)
-    mask = selector.get_support()
-    selected = [c for c, m in zip(candidates, mask) if m]
-
+    selector.fit(X, y)
+    selected = [c for c, m in zip(candidates, selector.get_support()) if m]
     logger.info(
-        "Paso 2 — ANOVA F-test (top %d%%): %d → %d features",
+        "Paso 2 — ANOVA (top %d%%): %d → %d features",
         percentile, len(candidates), len(selected),
     )
-    return selected, X_sel
+    return selected
 
 
 # ─── Paso 3: ElasticNet ───────────────────────────────────────────────────────
 
 def select_elasticnet(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
+    X: np.ndarray,
+    y: np.ndarray,
     candidates: list[str],
     l1_ratio: float = _EN_L1_RATIO,
     C: float = _EN_C,
     max_iter: int = _EN_MAX_ITER,
     random_state: int = _RANDOM_STATE,
 ) -> list[str]:
-    """Seleccionar features via ElasticNet: retiene aquellas con coef != 0.
+    """Seleccionar features con coeficiente ElasticNet distinto de cero.
 
     Parameters
     ----------
-    X_train : np.ndarray
-        Matriz de features post-ANOVA (ya filtrada y sin escalar).
-    y_train : np.ndarray
-        Vector target binario.
+    X : np.ndarray (n_samples, n_features)
+        Valores de las features en `candidates` (ya filtradas por ANOVA).
+    y : np.ndarray (n_samples,)
     candidates : list[str]
-        Nombres de features en el mismo orden que las columnas de X_train.
     l1_ratio : float
-        Mezcla L1/L2: 1.0 = L1 puro (mayor sparsity), 0.0 = L2 puro (Ridge).
+        Mezcla L1/L2 (1.0 = L1 puro, 0.0 = Ridge).
     C : float
-        Inverso de la fuerza de regularización; valores menores son más agresivos.
+        Inverso de la fuerza de regularización.
     max_iter : int
-        Iteraciones máximas del solver SAGA.
     random_state : int
-        Semilla para reproducibilidad.
 
     Returns
     -------
     list[str]
-        Nombres de features con coeficiente absoluto > 0 tras el ajuste.
+        Subset de `candidates` con coeficiente absoluto > 0.
 
     Notes
     -----
-    StandardScaler garantiza que los coeficientes sean comparables entre features
-    con escalas distintas (ej. monto en pesos vs. ratio 0–1).
-    Fit exclusivo sobre train: scaler y lr no ven datos de test/OOT.
+    StandardScaler garantiza comparabilidad entre features de escalas distintas
+    (ej. monto en pesos vs. ratio 0–1). Fit exclusivo sobre train.
     """
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_train)
-
+    X_scaled = StandardScaler().fit_transform(X)
     lr = LogisticRegression(
         penalty="elasticnet",
         solver="saga",
@@ -198,13 +184,12 @@ def select_elasticnet(
         class_weight="balanced",
         n_jobs=-1,
     )
-    lr.fit(X_scaled, y_train)
+    lr.fit(X_scaled, y)
 
-    coef = np.abs(lr.coef_[0])
+    coef     = np.abs(lr.coef_[0])
     selected = [c for c, v in zip(candidates, coef) if v > 0.0]
-
     logger.info(
-        "Paso 3 — ElasticNet (l1_ratio=%.1f, C=%.2f): %d → %d features (coef > 0)",
+        "Paso 3 — ElasticNet (l1=%.1f, C=%.2f): %d → %d features (coef > 0)",
         l1_ratio, C, len(candidates), len(selected),
     )
     return selected
@@ -215,74 +200,78 @@ def select_elasticnet(
 def run_feature_selection(
     train_path: Path,
     output_dir: Path,
-    anova_percentile: int = _ANOVA_PERCENTILE,
-    elasticnet_l1: float = _EN_L1_RATIO,
-    elasticnet_C: float = _EN_C,
+    var_threshold: float    = _VAR_THRESHOLD,
+    anova_percentile: int   = _ANOVA_PERCENTILE,
+    elasticnet_l1: float    = _EN_L1_RATIO,
+    elasticnet_C: float     = _EN_C,
 ) -> list[str]:
-    """Ejecutar el pipeline completo de selección sobre el conjunto de entrenamiento.
+    """Ejecutar el pipeline secuencial de selección sobre el conjunto de entrenamiento.
 
-    Pasos:
-      1. Filtro de varianza cero y sparsity extrema (no supervisado).
-      2. ANOVA F-test: top-percentil por F-score univariado.
-      3. ElasticNet (LogisticRegression L1+L2): coef != 0.
+    Flujo (secuencial — salida de cada paso es entrada del siguiente):
+      1. filter_low_variance  → pre_candidates
+      2. select_anova         → anova_candidates
+      3. select_elasticnet    → final_features
 
-    Guarda el resultado en ``output_dir/feature_cols.json``.
+    Salidas en output_dir:
+      - feature_cols.json: lista final de features seleccionadas.
 
     Parameters
     ----------
     train_path : Path
-        Ruta al parquet de entrenamiento generado por feature_engineering.
     output_dir : Path
-        Directorio donde se escribe feature_cols.json.
     anova_percentile : int
-        Percentil top para ANOVA F-test.
     elasticnet_l1 : float
-        l1_ratio para ElasticNet.
     elasticnet_C : float
-        C (inverso de regularización) para ElasticNet.
 
     Returns
     -------
     list[str]
-        Lista final de features seleccionadas.
+        Features seleccionadas en el orden resultante del pipeline.
     """
     logger.info("Cargando train desde %s", train_path)
     df_train = pd.read_parquet(train_path)
+    logger.info("Train: %d filas x %d cols", len(df_train), len(df_train.columns))
+
+    exclude    = set(JOIN_KEYS) | {TARGET_COL}
+    all_cands  = [c for c in df_train.columns if c not in exclude]
+    y          = df_train[TARGET_COL].astype(int).to_numpy()
+
+    # ── Paso 1: varianza / sparsity (no supervisado) ──────────────────────────
+    step1 = filter_low_variance(df_train, all_cands, var_threshold=var_threshold)
+
+    # Construir X con las candidatas post-paso 1
+    X1 = df_train[step1].fillna(0.0).to_numpy(dtype=np.float32)
     logger.info(
-        "Train cargado: %d filas x %d cols",
-        len(df_train), len(df_train.columns),
+        "Matriz X (paso 1→2): %d × %d (%.1f MB)",
+        X1.shape[0], X1.shape[1], X1.nbytes / 1024**2,
     )
 
-    exclude = set(JOIN_KEYS) | {TARGET_COL}
-    candidates = [c for c in df_train.columns if c not in exclude]
-    y = df_train[TARGET_COL].astype(int).to_numpy()
+    # ── Paso 2: ANOVA (supervisado, fit solo en train) ─────────────────────────
+    step2 = select_anova(X1, y, step1, percentile=anova_percentile)
+    del X1
 
-    logger.info("Candidatas iniciales: %d features", len(candidates))
-
-    # Paso 1: varianza / sparsity (ajustado sobre train)
-    candidates = filter_low_variance(df_train, candidates)
-
-    # Paso 2: ANOVA F-test (ajustado sobre train)
-    X = df_train[candidates].fillna(0.0).to_numpy(dtype=np.float32)
-    candidates, X = select_anova(X, y, candidates, percentile=anova_percentile)
-
-    # Paso 3: ElasticNet (ajustado sobre train)
-    feature_cols = select_elasticnet(
-        X, y, candidates, l1_ratio=elasticnet_l1, C=elasticnet_C,
+    # Reconstruir X con las candidatas post-paso 2
+    X2 = df_train[step2].fillna(0.0).to_numpy(dtype=np.float32)
+    logger.info(
+        "Matriz X (paso 2→3): %d × %d (%.1f MB)",
+        X2.shape[0], X2.shape[1], X2.nbytes / 1024**2,
     )
 
-    out = output_dir / "feature_cols.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "w") as fh:
-        json.dump(feature_cols, fh, indent=2)
+    # ── Paso 3: ElasticNet (supervisado, fit solo en train) ───────────────────
+    final = select_elasticnet(X2, y, step2, l1_ratio=elasticnet_l1, C=elasticnet_C)
+    del X2
+
+    # ── Guardar feature_cols.json ─────────────────────────────────────────────
+    output_dir.mkdir(parents=True, exist_ok=True)
+    feat_path = output_dir / "feature_cols.json"
+    with open(feat_path, "w") as fh:
+        json.dump(final, fh, indent=2)
 
     logger.info(
-        "Selección completada: %d → %d features finales | guardado en %s",
-        len([c for c in df_train.columns if c not in exclude]),
-        len(feature_cols),
-        out,
+        "Selección completada: %d candidatas → %d finales | %s",
+        len(all_cands), len(final), feat_path,
     )
-    return feature_cols
+    return final
 
 
 # ─── Entrypoint ───────────────────────────────────────────────────────────────
@@ -291,42 +280,27 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     parser = argparse.ArgumentParser(
-        description="Selección supervisada de features para débitos recurrentes."
+        description="Selección supervisada de features — débitos recurrentes."
     )
-    parser.add_argument(
-        "--train-path",
-        required=True,
-        help="Ruta a train.parquet generado por feature_engineering",
-    )
-    parser.add_argument(
-        "--output-dir",
-        required=True,
-        help="Directorio donde se escribe feature_cols.json",
-    )
-    parser.add_argument(
-        "--anova-percentile",
-        type=int,
-        default=_ANOVA_PERCENTILE,
-        help=f"Top %% de features por ANOVA F-score (default: {_ANOVA_PERCENTILE})",
-    )
-    parser.add_argument(
-        "--elasticnet-l1",
-        type=float,
-        default=_EN_L1_RATIO,
-        help=f"l1_ratio para ElasticNet (default: {_EN_L1_RATIO})",
-    )
-    parser.add_argument(
-        "--elasticnet-c",
-        type=float,
-        default=_EN_C,
-        help=f"C — inverso de regularización — para ElasticNet (default: {_EN_C})",
-    )
+    parser.add_argument("--train-path",       required=True,
+                        help="Ruta a train.parquet generado por feature_engineering")
+    parser.add_argument("--output-dir",       required=True,
+                        help="Directorio donde se escribe feature_cols.json")
+    parser.add_argument("--var-threshold",    type=float, default=_VAR_THRESHOLD,
+                        help=f"Varianza máxima para considerar una feature casi constante (default: {_VAR_THRESHOLD})")
+    parser.add_argument("--anova-percentile", type=int,   default=_ANOVA_PERCENTILE,
+                        help=f"Top %% ANOVA F-score (default: {_ANOVA_PERCENTILE})")
+    parser.add_argument("--elasticnet-l1",    type=float, default=_EN_L1_RATIO,
+                        help=f"l1_ratio ElasticNet (default: {_EN_L1_RATIO})")
+    parser.add_argument("--elasticnet-c",     type=float, default=_EN_C,
+                        help=f"C ElasticNet — inverso regularización (default: {_EN_C})")
     args = parser.parse_args()
 
     run_feature_selection(
-        train_path=Path(args.train_path),
-        output_dir=Path(args.output_dir),
-        anova_percentile=args.anova_percentile,
-        elasticnet_l1=args.elasticnet_l1,
-        elasticnet_C=args.elasticnet_c,
+        train_path       = Path(args.train_path),
+        output_dir       = Path(args.output_dir),
+        var_threshold    = args.var_threshold,
+        anova_percentile = args.anova_percentile,
+        elasticnet_l1    = args.elasticnet_l1,
+        elasticnet_C     = args.elasticnet_c,
     )

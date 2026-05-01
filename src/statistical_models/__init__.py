@@ -16,8 +16,13 @@ from src.statistical_models.logistic_regression import LogisticRegressionDebitCl
 from src.statistical_models.random_forest_classifier import RandomForestDebitClassifier
 from src.statistical_models.xgboost_classifier import XGBoostDebitClassifier
 
-# Modelos entrenados por defecto (excluye logistic_regression — solo baseline)
-DEFAULT_MODELS: list[str] = ["xgboost", "random_forest", "gradient_boosting"]
+# Los 4 modelos se entrenan por defecto para comparación completa en MLflow
+DEFAULT_MODELS: list[str] = [
+    "xgboost", 
+    # "random_forest", 
+    "gradient_boosting", 
+    "logistic_regression"
+    ]
 
 # Registro completo: nombre → clase del clasificador
 MODEL_REGISTRY: dict[str, type[BaseDebitClassifier]] = {
