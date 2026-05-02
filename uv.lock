@@ -901,7 +901,7 @@ wheels = [
 ]
 
 [[package]]
-name = "jhon-fredy-correa-gomez-exam"
+name = "jhon-fredy-correa-gomez-bancolombio"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
