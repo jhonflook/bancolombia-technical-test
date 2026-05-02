@@ -1,23 +1,28 @@
 x-airflow-common: &airflow-common
-  image: apache/airflow:2.8.1-python3.11
+  build:
+    context: .
+    dockerfile: deploy/Dockerfile.airflow
+  image: debit-airflow:latest
   env_file:
       - .env
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__FERNET_KEY: 'pG4mLrnAsQhNwXeAaEfwBnXsSgl6XW8uymZTxbm4QG4='
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT: '120'
     PROJECT_ROOT: ${PROJECT_ROOT}
     POSTGRES_HOST: postgres
-    _PIP_ADDITIONAL_REQUIREMENTS: apache-airflow-providers-docker apache-airflow-providers-postgres
   volumes:
     - ./data/dags:/opt/airflow/dags
     - ./data/queries:/opt/airflow/data/queries
     - /var/run/docker.sock:/var/run/docker.sock
     - airflow-logs:/opt/airflow/logs
   user: "${AIRFLOW_UID:-50000}:0"
+  group_add:
+    - "${DOCKER_GID:-998}"
   depends_on: &airflow-common-depends-on
     postgres:
       condition: service_healthy
@@ -84,6 +89,7 @@ services:
     command:
       - -c
       - |
+        export PATH=/home/airflow/.local/bin:/usr/local/bin:/usr/bin:/bin
         mkdir -p /opt/airflow/data/queries
         airflow db migrate
         airflow users create \
@@ -94,14 +100,14 @@ services:
           --email admin@example.com \
           --password admin || true
         airflow connections add 'debitdb' \
-          --conn-json '{
-              "conn_type": "postgres",
-              "login": "${POSTGRES_USER}",
-              "password": "${POSTGRES_PASSWORD}",
-              "host": "postgres",
-              "port": 5432,
-              "schema": "${POSTGRES_DB}"
-          }' || true
+          --conn-json "{
+              \"conn_type\": \"postgres\",
+              \"login\": \"${POSTGRES_USER}\",
+              \"password\": \"${POSTGRES_PASSWORD}\",
+              \"host\": \"postgres\",
+              \"port\": 5432,
+              \"schema\": \"${POSTGRES_DB}\"
+          }" || true
 
     depends_on:
       postgres:

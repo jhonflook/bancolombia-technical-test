@@ -3,19 +3,49 @@
 # =============================================================================
 
 up:
-	docker compose up --build -d
+	docker compose up --build -d postgres mlflow
 
 up-core:
 	docker compose up -d postgres mlflow metabase
-
-up-all:
-	docker compose up -d
 
 down:
 	docker compose down
 
 logs:
 	docker compose logs -f
+
+# =============================================================================
+# AIRFLOW — apache/airflow:2.8.1-python3.11 / localhost:8080
+# Primera vez: make airflow-init  (inicializa BD + crea usuario admin)
+# Arranque normal: make airflow-up
+# Trigger manual: make airflow-trigger
+# =============================================================================
+
+AIRFLOW_CLI = docker compose exec airflow-scheduler /home/airflow/.local/bin/airflow
+
+airflow-init:
+	docker compose up airflow-init
+
+airflow-up:
+	docker compose up -d airflow-webserver airflow-scheduler
+
+airflow-down:
+	docker compose stop airflow-webserver airflow-scheduler
+
+airflow-logs:
+	docker compose logs -f airflow-webserver airflow-scheduler
+
+airflow-trigger:
+	$(AIRFLOW_CLI) dags trigger debit_ml_pipeline
+
+airflow-status:
+	$(AIRFLOW_CLI) dags list-runs --dag-id debit_ml_pipeline --output table
+
+airflow-pause:
+	$(AIRFLOW_CLI) dags pause debit_ml_pipeline
+
+airflow-unpause:
+	$(AIRFLOW_CLI) dags unpause debit_ml_pipeline
 
 # =============================================================================
 # CARGA DE DATOS — src/dataset/loader.py
@@ -289,9 +319,19 @@ migrate-history:
 help:
 	@echo ""
 	@echo "=== INFRAESTRUCTURA ==="
-	@echo "  make up                   Levanta todos los servicios Docker"
-	@echo "  make up-core              Solo postgres + mlflow + metabase"
+	@echo "  make up                   Levanta postgres + mlflow"
+	@echo "  make up-core              postgres + mlflow + metabase"
 	@echo "  make down                 Detiene todos los servicios"
+	@echo ""
+	@echo "=== AIRFLOW (localhost:8080 — admin/admin) ==="
+	@echo "  make airflow-init         Primera vez: migra BD + crea usuario admin"
+	@echo "  make airflow-up           Arranca webserver + scheduler"
+	@echo "  make airflow-down         Detiene webserver + scheduler"
+	@echo "  make airflow-logs         Logs en tiempo real"
+	@echo "  make airflow-trigger      Dispara el DAG debit_ml_pipeline manualmente"
+	@echo "  make airflow-status       Lista runs del DAG"
+	@echo "  make airflow-pause        Pausa el DAG (evita ejecución @monthly)"
+	@echo "  make airflow-unpause      Activa el DAG"
 	@echo ""
 	@echo "=== CARGA DE DATOS ==="
 	@echo "  make load                 Carga todos los CSVs (default)"

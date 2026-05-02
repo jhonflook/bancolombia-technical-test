@@ -27,7 +27,6 @@ import os
 from datetime import datetime, timedelta
 
 from airflow import DAG
-from airflow.operators.bash import BashOperator
 from airflow.providers.docker.operators.docker import DockerOperator
 from docker.types import Mount
 
@@ -85,16 +84,20 @@ with DAG(
     doc_md=__doc__,
 ) as dag:
 
-    # ── T0: Crear directorio de artefactos en el host ─────────────────────
-    # Garantiza que el directorio existe con los permisos correctos antes de que
-    # Docker lo monte como volumen (si Docker lo crea, lo hace como root).
-    setup_artifacts_dir = BashOperator(
+    # ── T0: Crear directorio de artefactos ───────────────────────────────
+    # Corre como DockerOperator (igual que T1-T5) para tener acceso al mount
+    # de artifacts. Si el directorio ya existe en el host, es idempotente.
+    setup_artifacts_dir = DockerOperator(
         task_id="setup_artifacts_dir",
-        bash_command=(
-            f"mkdir -p '{PROJECT_ROOT}/data/artifacts' && "
-            f"echo 'Artifacts dir OK: {PROJECT_ROOT}/data/artifacts'"
-        ),
-        doc_md="Crea data/artifacts/ en el host antes del primer montaje Docker.",
+        image=IMAGE,
+        command="mkdir -p /app/data/artifacts && echo 'Artifacts dir OK'",
+        docker_url=DOCKER_URL,
+        network_mode=NETWORK,
+        environment=CONTAINER_ENV,
+        mounts=[ARTIFACTS_MOUNT],
+        auto_remove="force",
+        mount_tmp_dir=False,
+        doc_md="Crea /app/data/artifacts (montado desde PROJECT_ROOT/data/artifacts en el host).",
     )
 
     # ── T1: Carga CSV → PostgreSQL ────────────────────────────────────────
