@@ -1,15 +1,33 @@
 """DAG: Pipeline ML de débitos recurrentes — Bancolombia.
 
-Orquesta el pipeline completo de clasificación binaria:
-  1. setup_artifacts_dir     → Crea directorio de artefactos en el host
-  2. load_data               → Carga 6 CSVs a PostgreSQL (debit_* tables)
-  3. build_analytical_model  → Construye modelo analítico unificado (.parquet)
-  4. build_features          → Feature engineering + split Train/Test/OOT (S7)
-  5. train_model             → Entrena XGBoost + evalúa (AUC, KS) + registra en MLflow
-  6. provision_metabase      → Crea/actualiza dashboard Metabase vía API REST
+Cada tarea es controlable individualmente mediante parámetros del DAG.
+Los defaults se leen del .env (disponible en los contenedores Airflow via
+`env_file`); se pueden sobrescribir al disparar el DAG desde la UI o CLI.
 
-Cada tarea corre en el contenedor debit-ml:latest sobre la red debit_network,
-lo que garantiza acceso a postgres y mlflow sin exponer puertos al host.
+Parámetros (boolean) configurables en .env:
+  RUN_SETUP           → T0: crear directorio de artefactos
+  RUN_LOAD_DATA       → T1: carga CSV → PostgreSQL
+  RUN_BUILD_MODEL     → T2: modelo analítico unificado
+  RUN_BUILD_FEATURES  → T3: feature engineering + split Train/Test/OOT
+  RUN_SELECT_FEATURES → T3.5: selección supervisada de features
+  RUN_TRAIN           → T4: entrenamiento + MLflow
+  RUN_METABASE        → T5: provisionamiento tablero Metabase
+
+Ejemplo — re-entrenar sin recargar datos ni reconstruir features:
+    airflow dags trigger debit_ml_pipeline --conf '{
+        "run_load_data": false,
+        "run_build_model": false,
+        "run_build_features": false,
+        "run_select_features": false
+    }'
+
+Diseño de gates:
+  Cada ShortCircuitOperator (gate_*) actúa de "interruptor" para su tarea:
+  - ignore_downstream_trigger_rules=False → solo salta la tarea inmediata.
+  - TriggerRule.ALL_DONE en los gates siguientes → el pipeline continúa
+    aunque la tarea anterior haya sido saltada.
+
+  gate_T0 → T0 → gate_T1 → T1 → gate_T2 → T2 → ... → gate_T5 → T5
 
 Supuestos de infraestructura:
   - IMAGE:         debit-ml:latest  (construida con `docker compose build`)
@@ -18,35 +36,33 @@ Supuestos de infraestructura:
   - ARTIFACTS:     montado desde ${PROJECT_ROOT}/data/artifacts en /app/data/artifacts
   - POSTGRES_HOST: postgres  (nombre del servicio en debit_network)
   - MLFLOW_URI:    http://mlflow:5000 (nombre del servicio en debit_network)
-
-Ejecución manual:
-    airflow dags trigger debit_ml_pipeline
 """
 
 import os
 from datetime import datetime, timedelta
 
 from airflow import DAG
+from airflow.models.param import Param
+from airflow.operators.python import ShortCircuitOperator
 from airflow.providers.docker.operators.docker import DockerOperator
+from airflow.utils.trigger_rule import TriggerRule
 from docker.types import Mount
 
 # ─── Configuración de infraestructura ────────────────────────────────────────
 
 PROJECT_ROOT = os.environ.get(
     "PROJECT_ROOT",
-    "/home/jhonflook/Documents/analitico lll - Bancolombia/approach2",
+    "/home/jhonflook/Documents/projects/bancolombia-technical-test",
 )
 IMAGE = "debit-ml:latest"
 NETWORK = "debit_network"
 DOCKER_URL = "unix://var/run/docker.sock"
 
-# Variables de entorno inyectadas en cada contenedor Docker
 CONTAINER_ENV = {
     "POSTGRES_HOST": "postgres",
     "MLFLOW_TRACKING_URI": "http://mlflow:5000",
 }
 
-# Volúmenes compartidos entre tareas
 DATALAKE_MOUNT = Mount(
     source=f"{PROJECT_ROOT}/datalake",
     target="/app/datalake",
@@ -59,6 +75,61 @@ ARTIFACTS_MOUNT = Mount(
     type="bind",
     read_only=False,
 )
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _env_bool(var: str, default: bool = True) -> bool:
+    """Lee una variable de entorno como booleano (1/true/yes → True)."""
+    return os.getenv(var, str(default)).lower().strip() in ("1", "true", "yes")
+
+
+def _gate_callable(param_name: str):
+    """Devuelve un callable para ShortCircuitOperator que lee el param del DAG."""
+    def _check(**context):
+        return bool(context["params"][param_name])
+    return _check
+
+
+# ─── Parámetros del DAG (defaults desde .env) ────────────────────────────────
+
+DAG_PARAMS = {
+    "run_setup": Param(
+        default=_env_bool("RUN_SETUP"),
+        type="boolean",
+        description="T0: crear directorio de artefactos",
+    ),
+    "run_load_data": Param(
+        default=_env_bool("RUN_LOAD_DATA"),
+        type="boolean",
+        description="T1: cargar CSV → PostgreSQL",
+    ),
+    "run_build_model": Param(
+        default=_env_bool("RUN_BUILD_MODEL"),
+        type="boolean",
+        description="T2: modelo analítico unificado (LEFT JOIN)",
+    ),
+    "run_build_features": Param(
+        default=_env_bool("RUN_BUILD_FEATURES"),
+        type="boolean",
+        description="T3: feature engineering + split Train/Test/OOT",
+    ),
+    "run_select_features": Param(
+        default=_env_bool("RUN_SELECT_FEATURES"),
+        type="boolean",
+        description="T3.5: selección supervisada de features (varianza→ANOVA→ElasticNet)",
+    ),
+    "run_train": Param(
+        default=_env_bool("RUN_TRAIN"),
+        type="boolean",
+        description="T4: entrenamiento + evaluación + registro MLflow",
+    ),
+    "run_metabase": Param(
+        default=_env_bool("RUN_METABASE"),
+        type="boolean",
+        description="T5: provisionamiento tablero Metabase",
+    ),
+}
 
 # ─── DAG ─────────────────────────────────────────────────────────────────────
 
@@ -74,19 +145,84 @@ with DAG(
     dag_id="debit_ml_pipeline",
     description=(
         "Pipeline ML débitos recurrentes: "
-        "carga CSV → modelo analítico → features → XGBoost + MLflow"
+        "carga CSV → modelo analítico → features → clasificadores + MLflow"
     ),
     schedule_interval="@monthly",
     start_date=datetime(2025, 1, 1),
     catchup=False,
     default_args=default_args,
+    params=DAG_PARAMS,
     tags=["debit", "ml", "bancolombia"],
     doc_md=__doc__,
 ) as dag:
 
+    # ══════════════════════════════════════════════════════════════════════
+    # GATES — ShortCircuitOperator por tarea
+    # ignore_downstream_trigger_rules=False → solo omite la tarea inmediata.
+    # TriggerRule.ALL_DONE (gates T1 en adelante) → continúa aunque la
+    # tarea anterior haya sido saltada.
+    # ══════════════════════════════════════════════════════════════════════
+
+    gate_setup = ShortCircuitOperator(
+        task_id="gate_setup",
+        python_callable=_gate_callable("run_setup"),
+        ignore_downstream_trigger_rules=False,
+        doc_md="Ejecuta T0 si `run_setup=true` (default: RUN_SETUP en .env).",
+    )
+
+    gate_load_data = ShortCircuitOperator(
+        task_id="gate_load_data",
+        python_callable=_gate_callable("run_load_data"),
+        ignore_downstream_trigger_rules=False,
+        trigger_rule=TriggerRule.ALL_DONE,
+        doc_md="Ejecuta T1 si `run_load_data=true` (default: RUN_LOAD_DATA en .env).",
+    )
+
+    gate_build_model = ShortCircuitOperator(
+        task_id="gate_build_model",
+        python_callable=_gate_callable("run_build_model"),
+        ignore_downstream_trigger_rules=False,
+        trigger_rule=TriggerRule.ALL_DONE,
+        doc_md="Ejecuta T2 si `run_build_model=true` (default: RUN_BUILD_MODEL en .env).",
+    )
+
+    gate_build_features = ShortCircuitOperator(
+        task_id="gate_build_features",
+        python_callable=_gate_callable("run_build_features"),
+        ignore_downstream_trigger_rules=False,
+        trigger_rule=TriggerRule.ALL_DONE,
+        doc_md="Ejecuta T3 si `run_build_features=true` (default: RUN_BUILD_FEATURES en .env).",
+    )
+
+    gate_select_features = ShortCircuitOperator(
+        task_id="gate_select_features",
+        python_callable=_gate_callable("run_select_features"),
+        ignore_downstream_trigger_rules=False,
+        trigger_rule=TriggerRule.ALL_DONE,
+        doc_md="Ejecuta T3.5 si `run_select_features=true` (default: RUN_SELECT_FEATURES en .env).",
+    )
+
+    gate_train = ShortCircuitOperator(
+        task_id="gate_train",
+        python_callable=_gate_callable("run_train"),
+        ignore_downstream_trigger_rules=False,
+        trigger_rule=TriggerRule.ALL_DONE,
+        doc_md="Ejecuta T4 si `run_train=true` (default: RUN_TRAIN en .env).",
+    )
+
+    gate_metabase = ShortCircuitOperator(
+        task_id="gate_metabase",
+        python_callable=_gate_callable("run_metabase"),
+        ignore_downstream_trigger_rules=False,
+        trigger_rule=TriggerRule.ALL_DONE,
+        doc_md="Ejecuta T5 si `run_metabase=true` (default: RUN_METABASE en .env).",
+    )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # TAREAS — DockerOperator
+    # ══════════════════════════════════════════════════════════════════════
+
     # ── T0: Crear directorio de artefactos ───────────────────────────────
-    # Corre como DockerOperator (igual que T1-T5) para tener acceso al mount
-    # de artifacts. Si el directorio ya existe en el host, es idempotente.
     setup_artifacts_dir = DockerOperator(
         task_id="setup_artifacts_dir",
         image=IMAGE,
@@ -101,9 +237,6 @@ with DAG(
     )
 
     # ── T1: Carga CSV → PostgreSQL ────────────────────────────────────────
-    # Trunca las tablas debit_* e inserta los 6 CSVs por chunks de 5000 filas.
-    # --truncate garantiza idempotencia en re-ejecuciones mensuales del DAG.
-    # El entrypoint.sh corre `alembic upgrade head` antes de invocar el loader.
     load_data = DockerOperator(
         task_id="load_data",
         image=IMAGE,
@@ -122,15 +255,12 @@ with DAG(
         doc_md=(
             "Carga los 6 CSVs a PostgreSQL (debit_clients, debit_excedentes, "
             "debit_gestiones, debit_moras, debit_pagos, debit_canales). "
-            "Aplica S4 (canales ausentes → 0 en JSONB), S5 (nulos excedentes → NULL), "
-            "S11 (24 grupos canales conflictivos → excluidos)."
+            "Aplica S4 (canales ausentes → 0), S5 (nulos excedentes → NULL), "
+            "S11 (88 claves canales conflictivas → excluidas)."
         ),
     )
 
     # ── T2: Modelo analítico unificado ────────────────────────────────────
-    # Lee los 6 CSVs directamente (más eficiente que leer desde BD para ML),
-    # realiza LEFT JOINs, imputa nulos y persiste analytical_model.parquet.
-    # Lee desde datalake/ y escribe en data/artifacts/ — ambos montados.
     build_analytical_model = DockerOperator(
         task_id="build_analytical_model",
         image=IMAGE,
@@ -154,11 +284,6 @@ with DAG(
     )
 
     # ── T3: Feature engineering + split temporal ──────────────────────────
-    # Lee analytical_model.parquet, construye features derivadas (exclusividad
-    # de canal, recurrencia de débito, ratios de gestiones, coeficientes de mora,
-    # indicadores de excedente) y guarda los splits temporales definidos en S7.
-    # Salidas: train.parquet, test.parquet, oot.parquet con TODAS las features
-    # candidatas (base + derivadas, ~240 cols). feature_cols.json se genera en T3.5.
     build_features = DockerOperator(
         task_id="build_features",
         image=IMAGE,
@@ -182,9 +307,6 @@ with DAG(
     )
 
     # ── T3.5: Selección supervisada de features ───────────────────────────
-    # Pipeline de selección en 3 pasos ajustados SOLO sobre train.parquet
-    # (anti-leakage): varianza/sparsity → ANOVA F-test → ElasticNet.
-    # Genera feature_cols.json que consume T4 para entrenamiento.
     select_features = DockerOperator(
         task_id="select_features",
         image=IMAGE,
@@ -209,9 +331,6 @@ with DAG(
     )
 
     # ── T4: Entrenamiento + evaluación + MLflow ───────────────────────────
-    # Entrena XGBoost con scale_pos_weight = n_neg/n_pos para el desbalance 3.7:1.
-    # Evalúa en las 3 particiones con AUC-ROC, KS, Precision/Recall, AUC-PR.
-    # Registra parámetros, métricas, feature importance y modelo en MLflow.
     train_model = DockerOperator(
         task_id="train_model",
         image=IMAGE,
@@ -235,9 +354,6 @@ with DAG(
     )
 
     # ── T5: Provisionamiento del tablero Metabase ─────────────────────────
-    # Configura Metabase vía API REST: conexión a debitdb, 10 questions
-    # (usando vistas v_debit_*) y dashboard ensamblado.
-    # Es idempotente: reutiliza cards y dashboard si ya existen.
     provision_metabase = DockerOperator(
         task_id="provision_metabase",
         image=IMAGE,
@@ -263,13 +379,17 @@ with DAG(
         ),
     )
 
-    # ─── Dependencias (pipeline lineal) ──────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # DEPENDENCIAS
+    # Cada gate activa o salta su tarea; el siguiente gate arranca siempre
+    # (ALL_DONE) sin importar si la tarea fue ejecutada o saltada.
+    # ══════════════════════════════════════════════════════════════════════
     (
-        setup_artifacts_dir
-        >> load_data
-        >> build_analytical_model
-        >> build_features
-        >> select_features
-        >> train_model
-        >> provision_metabase
+        gate_setup >> setup_artifacts_dir
+        >> gate_load_data >> load_data
+        >> gate_build_model >> build_analytical_model
+        >> gate_build_features >> build_features
+        >> gate_select_features >> select_features
+        >> gate_train >> train_model
+        >> gate_metabase >> provision_metabase
     )
