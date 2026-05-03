@@ -30,6 +30,7 @@ class GradientBoostingDebitClassifier(BaseDebitClassifier):
         min_samples_leaf: int = 20,
         l2_regularization: float = 0.0,
         scale_pos_weight: float = 1.0,
+        expose_history: bool = False,
         **kwargs: Any,
     ) -> HistGradientBoostingClassifier:
         """Crear HistGradientBoostingClassifier con class_weight para desbalance.
@@ -57,6 +58,20 @@ class GradientBoostingDebitClassifier(BaseDebitClassifier):
             Clasificador configurado.
         """
         class_weight = {0: 1.0, 1: scale_pos_weight}
+        if expose_history:
+            return HistGradientBoostingClassifier(
+                max_iter=max_iter,
+                learning_rate=learning_rate,
+                max_depth=max_depth,
+                min_samples_leaf=min_samples_leaf,
+                l2_regularization=l2_regularization,
+                class_weight=class_weight,
+                early_stopping=True,
+                validation_fraction=0.15,
+                n_iter_no_change=20,
+                scoring="loss",
+                random_state=42,
+            )
         return HistGradientBoostingClassifier(
             max_iter=max_iter,
             learning_rate=learning_rate,
@@ -67,6 +82,20 @@ class GradientBoostingDebitClassifier(BaseDebitClassifier):
             early_stopping=False,
             random_state=42,
         )
+
+    def get_training_history(self) -> dict | None:
+        """Extraer curva de pérdida por iteración cuando expose_history=True."""
+        if not self.is_fitted or self.model is None:
+            return None
+        train_scores = getattr(self.model, "train_score_", None)
+        val_scores   = getattr(self.model, "validation_score_", None)
+        if train_scores is None:
+            return None
+        # HistGBM almacena el negativo de la pérdida (sklearn maximiza) → negamos para obtener loss
+        return {
+            "train_loss": (-train_scores).tolist(),
+            "val_loss":   (-val_scores).tolist() if val_scores is not None else [],
+        }
 
     def get_feature_importances(self) -> dict[str, float] | None:
         """Devuelve None: HistGradientBoostingClassifier no expone feature_importances_.

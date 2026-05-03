@@ -135,6 +135,17 @@ class XGBoostDebitClassifier(BaseDebitClassifier):
             raise ValueError("El modelo debe ajustarse antes de predecir.")
         return self.model.predict_proba(X[self.selected_features].fillna(0.0))[:, 1]
 
+    def get_training_history(self) -> dict | None:
+        """Extraer curva de validación AUC por ronda desde evals_result_."""
+        if not self.is_fitted or self.model is None:
+            return None
+        evals = getattr(self.model, "evals_result_", None)
+        if not evals:
+            return None
+        val_key = next(iter(evals))
+        metric_key = next(iter(evals[val_key]))
+        return {"val_auc": evals[val_key][metric_key]}
+
     def get_hyperparameter_space(self, trial: optuna.Trial) -> dict[str, Any]:
         """Espacio de búsqueda Optuna para XGBoost.
 

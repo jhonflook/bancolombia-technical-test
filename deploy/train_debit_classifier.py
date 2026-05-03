@@ -17,13 +17,26 @@ Métricas con evolución temporal (step-based) por run hijo:
   evolution_auc_roc/ks/f1_05/auc_pr @ step=0(train)/1(test)/2(oot) → degradación
 
 Figuras logueadas como artefactos (visibles en pestaña Artifacts de MLflow):
-  figures/roc_curve.png           → curvas ROC train/test/oot superpuestas
-  figures/pr_curve.png            → curvas Precision-Recall train/test/oot
-  figures/feature_importance.png  → top-20 features por importancia
-  figures/optuna_history.png      → evolución AUC por trial Optuna (si n_trials>0)
+  figures/roc_curve.png               → curvas ROC train/test/oot superpuestas
+  figures/pr_curve.png                → curvas Precision-Recall train/test/oot
+  figures/feature_importance.png      → top-20 features por importancia nativa
+  figures/optuna_history.png          → evolución AUC por trial Optuna (si n_trials>0)
+  figures/score_distribution.png      → histograma de scores por clase (train/test/oot)
+  figures/confusion_matrix.png        → matriz de confusión en test al umbral KS
+  figures/ks_lift_chart.png           → curva de ganancias + lift por decil (test)
+  figures/training_curve.png          → AUC por ronda (XGBoost) o pérdida por iter (GBM)
+  figures/calibration_curve.png       → diagrama de calibración con Brier score (test)
+  figures/shap_summary.png            → SHAP beeswarm top-20 (todos los modelos)
+  figures/shap_bar.png                → SHAP mean|SHAP| bar chart top-20
+  figures/shap_dependence_<feat>.png  → SHAP dependence plot top-3 features
+
+SHAP: TreeExplainer (xgboost/gradient_boosting/random_forest), LinearExplainer (logistic_regression)
 
 Métricas escalares por run hijo (para filtrado en MLflow):
   cv_auc, train_*, test_*, oot_*
+  {partition}_brier, {partition}_log_loss    → calibración por partición
+  training_time_sec, model_size_kb           → recursos de entrenamiento
+  n_rounds_used                              → rondas XGBoost tras early stopping
 
 Uso:
     uv run python deploy/train_debit_classifier.py --data-dir data/artifacts
@@ -40,16 +53,22 @@ import json
 import logging
 import pickle
 import tempfile
+import time
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")  # backend sin pantalla para entornos headless
 import matplotlib.pyplot as plt
 import mlflow
+import numpy as np
 import optuna
 import pandas as pd
 from sklearn.metrics import (
+    ConfusionMatrixDisplay,
     auc as sklearn_auc,
+    brier_score_loss,
+    confusion_matrix,
+    log_loss as sklearn_log_loss,
     precision_recall_curve,
     roc_auc_score,
     roc_curve,
@@ -59,6 +78,7 @@ from src.statistical_models import DEFAULT_MODELS, MODEL_REGISTRY
 from src.statistical_models.evaluation import (
     CVResults,
     compute_classification_metrics,
+    compute_ks,
     evaluate_classifier_cv,
 )
 
@@ -230,8 +250,10 @@ def train_and_evaluate(
     logger.info("[%s] Entrenando modelo final | params=%s", model_name, best_params)
     X_tr = df_train[feature_cols].fillna(0.0)
     y_tr = df_train[TARGET_COL].astype(int)
+    t0 = time.time()
     clf.fit(X_tr, y_tr, selected_features=feature_cols,
-            scale_pos_weight=scale_pos_weight, **best_params)
+            scale_pos_weight=scale_pos_weight, expose_history=True, **best_params)
+    training_time_sec = round(time.time() - t0, 2)
 
     all_metrics: dict[str, float] = {}
     for partition, df_part in [("train", df_train), ("test", df_test), ("oot", df_oot)]:
@@ -241,26 +263,37 @@ def train_and_evaluate(
 
         part_metrics = compute_classification_metrics(y_part.values, y_prob, partition=partition)
         all_metrics.update(part_metrics)
+        all_metrics[f"{partition}_brier"]    = round(float(brier_score_loss(y_part.values, y_prob)), 4)
+        all_metrics[f"{partition}_log_loss"] = round(float(sklearn_log_loss(y_part.values, y_prob)), 4)
 
         logger.info(
-            "[%s | %s] n=%d | AUC=%.4f | KS=%.4f | F1@0.5=%.3f | AUC-PR=%.4f",
+            "[%s | %s] n=%d | AUC=%.4f | KS=%.4f | F1@0.5=%.3f | AUC-PR=%.4f | Brier=%.4f",
             model_name, partition, len(df_part),
             part_metrics[f"{partition}_auc_roc"],
             part_metrics[f"{partition}_ks"],
             part_metrics[f"{partition}_f1_05"],
             part_metrics[f"{partition}_auc_pr"],
+            all_metrics[f"{partition}_brier"],
         )
 
     artifact_path = data_path / f"model_{model_name}.pkl"
     with open(artifact_path, "wb") as fh:
         pickle.dump({"model": clf, "feature_cols": feature_cols}, fh)
+    model_size_kb = round(artifact_path.stat().st_size / 1024, 1)
+
+    training_history = clf.get_training_history()
+    if training_history and "val_auc" in training_history:
+        all_metrics["n_rounds_used"] = len(training_history["val_auc"])
 
     return {
-        "model":         clf,
-        "metrics":       all_metrics,
-        "artifact_path": artifact_path,
-        "test_auc":      all_metrics["test_auc_roc"],
-        "importances":   clf.get_feature_importances(),
+        "model":             clf,
+        "metrics":           all_metrics,
+        "artifact_path":     artifact_path,
+        "test_auc":          all_metrics["test_auc_roc"],
+        "importances":       clf.get_feature_importances(),
+        "training_history":  training_history,
+        "training_time_sec": training_time_sec,
+        "model_size_kb":     model_size_kb,
     }
 
 
@@ -372,6 +405,244 @@ def _log_figures(
         except Exception as exc:
             logger.warning("[%s] No se pudo loguear Optuna history: %s", model_name, exc)
 
+    # ── Score distribution (histograma de scores por clase) ──────────────────
+    try:
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        for ax, (pname, df_p) in zip(axes, partitions):
+            y_true = df_p[TARGET_COL].astype(int).values
+            y_prob = clf.predict_proba(df_p[feature_cols].fillna(0.0))
+            ax.hist(y_prob[y_true == 0], bins=40, alpha=0.65,
+                    label="Clase 0 (sin débito)", color="crimson", density=True)
+            ax.hist(y_prob[y_true == 1], bins=40, alpha=0.65,
+                    label="Clase 1 (débito exc.)", color="steelblue", density=True)
+            ax.set_title(f"{pname.upper()}")
+            ax.set_xlabel("P(débito recurrente)")
+            ax.set_ylabel("Densidad")
+            ax.legend(fontsize=9)
+            ax.grid(alpha=0.3)
+        fig.suptitle(f"Score Distribution — {model_name}", fontsize=14, fontweight="bold")
+        fig.tight_layout()
+        mlflow.log_figure(fig, "figures/score_distribution.png")
+        plt.close(fig)
+    except Exception as exc:
+        logger.warning("[%s] No se pudo loguear score distribution: %s", model_name, exc)
+
+    # ── Confusion matrix en test al umbral KS ───────────────────────────────
+    try:
+        y_true_t = df_test[TARGET_COL].astype(int).values
+        y_prob_t = clf.predict_proba(df_test[feature_cols].fillna(0.0))
+        _, ks_thr = compute_ks(y_true_t, y_prob_t)
+        y_pred_ks = (y_prob_t >= ks_thr).astype(int)
+        cm = confusion_matrix(y_true_t, y_pred_ks)
+        fig, ax = plt.subplots(figsize=(6, 5))
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm,
+                                      display_labels=["Clase 0", "Clase 1"])
+        disp.plot(ax=ax, colormap="Blues", values_format="d")
+        ax.set_title(f"Confusion Matrix — Test (thr KS={ks_thr:.3f})\n{model_name}")
+        fig.tight_layout()
+        mlflow.log_figure(fig, "figures/confusion_matrix.png")
+        plt.close(fig)
+    except Exception as exc:
+        logger.warning("[%s] No se pudo loguear confusion matrix: %s", model_name, exc)
+
+    # ── KS Lift chart (curva de ganancias acumuladas) ────────────────────────
+    try:
+        y_true_t = df_test[TARGET_COL].astype(int).values
+        y_prob_t = clf.predict_proba(df_test[feature_cols].fillna(0.0))
+        order = np.argsort(-y_prob_t)
+        n_total   = len(y_true_t)
+        n_pos     = y_true_t.sum()
+        pct_pop   = np.arange(1, n_total + 1) / n_total
+        cum_gains = y_true_t[order].cumsum() / n_pos
+        baseline  = pct_pop
+        lift      = cum_gains / np.where(baseline > 0, baseline, 1)
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        axes[0].plot(pct_pop * 100, cum_gains * 100, color="steelblue", linewidth=2,
+                     label="Modelo")
+        axes[0].plot([0, 100], [0, 100], "k--", alpha=0.4, label="Aleatorio")
+        axes[0].set_xlabel("% Población contactada")
+        axes[0].set_ylabel("% Clase 1 capturada")
+        axes[0].set_title("Curva de Ganancias (Test)")
+        axes[0].legend()
+        axes[0].grid(alpha=0.3)
+
+        decile_pct = np.linspace(10, 100, 10)
+        decile_lift = [lift[int(p / 100 * n_total) - 1] for p in decile_pct]
+        axes[1].bar(decile_pct, decile_lift, width=8, color="steelblue",
+                    edgecolor="white", alpha=0.85)
+        axes[1].axhline(1.0, color="red", linestyle="--", linewidth=1.5,
+                        label="Baseline (lift=1)")
+        axes[1].set_xlabel("Decil (% población)")
+        axes[1].set_ylabel("Lift")
+        axes[1].set_title("Lift por Decil (Test)")
+        axes[1].legend()
+        axes[1].grid(axis="y", alpha=0.3)
+
+        fig.suptitle(f"KS Lift Chart — {model_name}", fontsize=13, fontweight="bold")
+        fig.tight_layout()
+        mlflow.log_figure(fig, "figures/ks_lift_chart.png")
+        plt.close(fig)
+    except Exception as exc:
+        logger.warning("[%s] No se pudo loguear KS lift chart: %s", model_name, exc)
+
+    # ── SHAP plots — todos los modelos ──────────────────────────────────────
+    # Tree models: TreeExplainer | logistic_regression: LinearExplainer (scaled)
+    try:
+        import shap
+        inner_model = getattr(clf, "model", None)
+        if inner_model is not None:
+            X_shap_raw = (
+                df_test[feature_cols]
+                .fillna(0.0)
+                .sample(min(800, len(df_test)), random_state=42)
+            )
+
+            if model_name in ("xgboost", "gradient_boosting", "random_forest"):
+                explainer   = shap.TreeExplainer(inner_model)
+                shap_values = explainer.shap_values(X_shap_raw, check_additivity=False)
+                X_shap_disp = X_shap_raw
+            elif model_name == "logistic_regression":
+                scaler = getattr(clf, "scaler", None)
+                X_scaled = pd.DataFrame(
+                    scaler.transform(X_shap_raw) if scaler is not None else X_shap_raw.values,
+                    columns=feature_cols,
+                    index=X_shap_raw.index,
+                )
+                explainer   = shap.LinearExplainer(inner_model, X_scaled)
+                shap_values = explainer.shap_values(X_scaled)
+                X_shap_disp = X_scaled
+            else:
+                raise ValueError(f"Explainer no definido para: {model_name}")
+
+            if isinstance(shap_values, list):
+                shap_values = shap_values[1]
+
+            # Beeswarm (summary_plot tipo dot)
+            fig = plt.figure(figsize=(10, 8))
+            shap.summary_plot(shap_values, X_shap_disp, show=False,
+                              max_display=20, plot_type="dot")
+            plt.title(f"SHAP Summary (beeswarm) — {model_name}",
+                      fontsize=13, fontweight="bold")
+            plt.tight_layout()
+            mlflow.log_figure(fig, "figures/shap_summary.png")
+            plt.close(fig)
+
+            # Bar (importancia media absoluta SHAP)
+            fig = plt.figure(figsize=(10, 7))
+            shap.summary_plot(shap_values, X_shap_disp, show=False,
+                              max_display=20, plot_type="bar")
+            plt.title(f"SHAP Feature Importance (mean |SHAP|) — {model_name}", fontsize=13)
+            plt.tight_layout()
+            mlflow.log_figure(fig, "figures/shap_bar.png")
+            plt.close(fig)
+
+            # Dependence plots — top 3 features por mean |SHAP|
+            mean_abs    = np.abs(shap_values).mean(axis=0)
+            top3_idx    = np.argsort(mean_abs)[-3:][::-1]
+            top3_feats  = [feature_cols[i] for i in top3_idx]
+            for feat in top3_feats:
+                try:
+                    safe = feat.replace("/", "_").replace(" ", "_")
+                    fig, ax = plt.subplots(figsize=(8, 5))
+                    shap.dependence_plot(
+                        feat, shap_values, X_shap_disp,
+                        ax=ax, show=False, interaction_index=None,
+                        dot_size=12, alpha=0.6,
+                    )
+                    ax.set_title(f"SHAP Dependence — {feat}\n{model_name}", fontsize=11)
+                    fig.tight_layout()
+                    mlflow.log_figure(fig, f"figures/shap_dependence_{safe}.png")
+                    plt.close(fig)
+                except Exception as dep_exc:
+                    logger.debug("[%s] SHAP dependence '%s': %s", model_name, feat, dep_exc)
+
+            logger.info("[%s] SHAP plots logueados (%d features).", model_name, len(feature_cols))
+    except Exception as exc:
+        logger.warning("[%s] SHAP plots fallaron: %s", model_name, exc)
+
+
+def _log_training_curve_figure(model_name: str, training_history: dict | None) -> None:
+    """Loguear figura de evolución métrica/pérdida por iteración en el run MLflow activo."""
+    if not training_history:
+        return
+    try:
+        if "val_auc" in training_history:
+            val_auc  = training_history["val_auc"]
+            rounds   = list(range(len(val_auc)))
+            best_r   = int(np.argmax(val_auc))
+            fig, ax  = plt.subplots(figsize=(9, 5))
+            ax.plot(rounds, val_auc, color="darkorange", linewidth=2,
+                    label="AUC validación interna")
+            ax.fill_between(rounds, val_auc, alpha=0.12, color="darkorange")
+            ax.axvline(best_r, color="crimson", linestyle="--", alpha=0.75,
+                       label=f"Mejor ronda={best_r}  AUC={val_auc[best_r]:.4f}")
+            ax.set_xlabel("Ronda de boosting")
+            ax.set_ylabel("AUC (validación interna 15%)")
+            ax.set_title(f"Curva de Entrenamiento — {model_name}", fontweight="bold")
+            ax.legend()
+            ax.grid(alpha=0.3)
+            fig.tight_layout()
+            mlflow.log_figure(fig, "figures/training_curve.png")
+            plt.close(fig)
+
+        elif "train_loss" in training_history:
+            train_loss = training_history["train_loss"]
+            val_loss   = training_history.get("val_loss", [])
+            iters      = list(range(len(train_loss)))
+            fig, ax    = plt.subplots(figsize=(9, 5))
+            ax.plot(iters, train_loss, color="royalblue", linewidth=2, label="Train loss")
+            if val_loss:
+                v_iters = list(range(len(val_loss)))
+                ax.plot(v_iters, val_loss, color="darkorange", linewidth=2,
+                        label="Val loss (early stopping)")
+                best_i = int(np.argmin(val_loss))
+                ax.axvline(best_i, color="crimson", linestyle="--", alpha=0.75,
+                           label=f"Mejor iter={best_i}  val_loss={val_loss[best_i]:.4f}")
+            ax.set_xlabel("Iteración")
+            ax.set_ylabel("Log-loss")
+            ax.set_title(f"Curva de Pérdida — {model_name}", fontweight="bold")
+            ax.legend()
+            ax.grid(alpha=0.3)
+            fig.tight_layout()
+            mlflow.log_figure(fig, "figures/training_curve.png")
+            plt.close(fig)
+
+    except Exception as exc:
+        logger.warning("[%s] No se pudo loguear training curve: %s", model_name, exc)
+
+
+def _log_calibration_figure(
+    clf,
+    df_test: pd.DataFrame,
+    feature_cols: list[str],
+    model_name: str,
+) -> None:
+    """Loguear diagrama de calibración (reliability diagram) sobre la partición test."""
+    try:
+        from sklearn.calibration import calibration_curve
+        y_true = df_test[TARGET_COL].astype(int).values
+        y_prob = clf.predict_proba(df_test[feature_cols].fillna(0.0))
+        frac_pos, mean_pred = calibration_curve(y_true, y_prob, n_bins=10)
+        brier = float(brier_score_loss(y_true, y_prob))
+
+        fig, ax = plt.subplots(figsize=(7, 6))
+        ax.plot(mean_pred, frac_pos, "s-", color="steelblue", linewidth=2, label="Modelo")
+        ax.plot([0, 1], [0, 1], "k--", alpha=0.5, label="Perfectamente calibrado")
+        ax.set_xlabel("Probabilidad predicha (media del bin)")
+        ax.set_ylabel("Fracción de positivos observados")
+        ax.set_title(
+            f"Diagrama de Calibración (Test) — {model_name}\nBrier={brier:.4f}",
+            fontweight="bold",
+        )
+        ax.legend(loc="lower right")
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        mlflow.log_figure(fig, "figures/calibration_curve.png")
+        plt.close(fig)
+    except Exception as exc:
+        logger.warning("[%s] No se pudo loguear calibration curve: %s", model_name, exc)
+
 
 def _log_model_run(
     model_name: str,
@@ -387,6 +658,7 @@ def _log_model_run(
     df_test: pd.DataFrame,
     df_oot: pd.DataFrame,
     feature_cols: list[str],
+    split_strategy: str = "temporal",
 ) -> str:
     """Registrar run hijo anidado en MLflow para un modelo.
 
@@ -420,8 +692,15 @@ def _log_model_run(
 
         # ── Tags ──────────────────────────────────────────────────────────────
         mlflow.set_tags({
-            "model_type": model_name,
-            "framework":  "sklearn-compatible",
+            "model_type":          model_name,
+            "framework":           "sklearn-compatible",
+            "split_strategy":      split_strategy,
+            "target_rate_train":   f"{df_train[TARGET_COL].mean():.3f}",
+            "target_rate_test":    f"{df_test[TARGET_COL].mean():.3f}",
+            "target_rate_oot":     f"{df_oot[TARGET_COL].mean():.3f}",
+            "n_train":             str(len(df_train)),
+            "n_test":              str(len(df_test)),
+            "n_oot":               str(len(df_oot)),
         })
 
         # ── Parámetros ────────────────────────────────────────────────────────
@@ -463,6 +742,31 @@ def _log_model_run(
                         result["metrics"][key],
                         step=step,
                     )
+
+        # ── Métricas adicionales: tiempo, tamaño, rondas usadas ─────────────
+        for extra_key in ("training_time_sec", "model_size_kb"):
+            val = result.get(extra_key)
+            if val is not None:
+                mlflow.log_metric(extra_key, val)
+
+        # ── Curva de entrenamiento por iteración/ronda (step-based) ─────────
+        training_history = result.get("training_history")
+        if training_history:
+            if "val_auc" in training_history:
+                mlflow.log_metric("n_rounds_used", len(training_history["val_auc"]))
+                for step, val in enumerate(training_history["val_auc"]):
+                    mlflow.log_metric("xgb_val_auc_per_round", round(val, 4), step=step)
+            if "train_loss" in training_history:
+                for step, tl in enumerate(training_history["train_loss"]):
+                    mlflow.log_metric("gbm_train_loss_per_iter", round(tl, 5), step=step)
+                for step, vl in enumerate(training_history.get("val_loss", [])):
+                    mlflow.log_metric("gbm_val_loss_per_iter", round(vl, 5), step=step)
+
+        # ── Figura curva de entrenamiento ────────────────────────────────────
+        _log_training_curve_figure(model_name, training_history)
+
+        # ── Diagrama de calibración ──────────────────────────────────────────
+        _log_calibration_figure(result["model"], df_test, feature_cols, model_name)
 
         # ── Figuras matplotlib como artefactos ───────────────────────────────
         _log_figures(
@@ -546,6 +850,13 @@ def main() -> None:
             "scale_pos_weight": round(scale_pos_weight, 4),
             "split_strategy":   args.split_strategy,
         })
+        mlflow.set_tags({
+            "split_strategy":      args.split_strategy,
+            "target_rate_train":   f"{df_train[TARGET_COL].mean():.3f}",
+            "target_rate_test":    f"{df_test[TARGET_COL].mean():.3f}",
+            "target_rate_oot":     f"{df_oot[TARGET_COL].mean():.3f}",
+            "n_features_selected": str(len(feature_cols)),
+        })
 
         # ── Un run hijo por modelo (nested=True) ─────────────────────────────
         for model_name in model_names:
@@ -605,6 +916,7 @@ def main() -> None:
                     df_test=df_test,
                     df_oot=df_oot,
                     feature_cols=feature_cols,
+                    split_strategy=args.split_strategy,
                 )
 
             except Exception as exc:

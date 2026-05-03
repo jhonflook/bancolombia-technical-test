@@ -192,6 +192,108 @@ _QUESTIONS: list[tuple[str, str, str]] = [
         """,
         "bar",
     ),
+    # ── Preprocesamiento ────────────────────────────────────────────────────────
+    (
+        "11. Retención de Datos en Carga por Fuente",
+        """
+        SELECT fuente,
+               rows_bruto::int    AS filas_brutas,
+               rows_cargados::int AS filas_cargadas,
+               retencion_pct
+        FROM v_debit_pipeline_load_summary
+        WHERE run_id = (
+            SELECT run_id FROM debit_pipeline_metrics
+            ORDER BY run_date DESC LIMIT 1
+        )
+        ORDER BY fuente
+        """,
+        "bar",
+    ),
+    (
+        "12. Duplicados Eliminados en Carga",
+        """
+        SELECT fuente,
+               COALESCE(dup_exactos::int,    0) AS duplicados_exactos,
+               COALESCE(dup_conflicto::int,  0) AS duplicados_conflicto
+        FROM v_debit_pipeline_load_summary
+        WHERE run_id = (
+            SELECT run_id FROM debit_pipeline_metrics
+            ORDER BY run_date DESC LIMIT 1
+        )
+        ORDER BY fuente
+        """,
+        "bar",
+    ),
+    (
+        "13. Funnel de Selección de Features",
+        """
+        SELECT split_strategy,
+               paso,
+               cols::int AS n_features
+        FROM (
+            SELECT split_strategy, '1. Candidatas iniciales'  AS paso, cols_inicial::int      AS cols FROM v_debit_pipeline_feature_funnel
+            UNION ALL
+            SELECT split_strategy, '2. Tras varianza/sparsity',        cols_tras_varianza::int        FROM v_debit_pipeline_feature_funnel
+            UNION ALL
+            SELECT split_strategy, '3. Tras ANOVA F-test',             cols_tras_anova::int           FROM v_debit_pipeline_feature_funnel
+            UNION ALL
+            SELECT split_strategy, '4. Final — ElasticNet',            cols_final::int                FROM v_debit_pipeline_feature_funnel
+        ) t
+        ORDER BY split_strategy, paso
+        """,
+        "bar",
+    ),
+    (
+        "14. Dimensiones de Particiones Train / Test / OOT",
+        """
+        SELECT particion,
+               filas,
+               features_candidatas,
+               features_seleccionadas,
+               tasa_clase1,
+               memoria_mb,
+               nulos_totales,
+               inf_totales
+        FROM v_debit_pipeline_splits
+        WHERE run_id = (
+            SELECT run_id FROM debit_pipeline_metrics
+            ORDER BY run_date DESC LIMIT 1
+        )
+        ORDER BY particion
+        """,
+        "table",
+    ),
+    (
+        "15. Balance de Clases por Partición",
+        """
+        SELECT particion,
+               clase1_count AS clase_1_debito_recurrente,
+               clase0_count AS clase_0_sin_patron
+        FROM v_debit_pipeline_splits
+        WHERE run_id = (
+            SELECT run_id FROM debit_pipeline_metrics
+            ORDER BY run_date DESC LIMIT 1
+        )
+        ORDER BY particion
+        """,
+        "bar",
+    ),
+    (
+        "16. Features Seleccionadas por Grupo Temático",
+        """
+        SELECT source_name   AS grupo_tematico,
+               metric_value::int AS n_features
+        FROM debit_pipeline_metrics
+        WHERE stage       = 'feature_selection'
+          AND metric_name = 'cols_group'
+          AND run_id = (
+              SELECT run_id FROM debit_pipeline_metrics
+              ORDER BY run_date DESC LIMIT 1
+          )
+        ORDER BY metric_value DESC
+        """,
+        "bar",
+    ),
 ]
 
 

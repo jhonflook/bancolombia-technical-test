@@ -38,7 +38,7 @@ _SPARSITY_LIMIT   = 0.99  # >= 99% ceros → eliminar
 _ANOVA_PERCENTILE = 80    # top-80% por F-score ANOVA
 _EN_L1_RATIO      = 0.7   # mezcla L1/L2 para ElasticNet (1.0 = L1 puro)
 _EN_C             = 0.1   # inverso de regularización (menor = más agresivo)
-_EN_MAX_ITER      = 3000
+_EN_MAX_ITER      = 6000
 _RANDOM_STATE     = 42
 _CHUNK            = 500   # columnas por bloque en el filtro de varianza
 
@@ -66,7 +66,8 @@ def filter_low_variance(
 
     Returns
     -------
-    list[str]
+    tuple[list[str], int, int]
+        (features retenidas, n eliminadas por baja varianza, n eliminadas por sparsity)
 
     Notes
     -----
@@ -96,7 +97,7 @@ def filter_low_variance(
         removed_var + removed_sparse, var_threshold, removed_var,
         sparsity_limit * 100, removed_sparse, len(keep),
     )
-    return keep
+    return keep, removed_var, removed_sparse
 
 
 # ─── Paso 2: ANOVA F-test ─────────────────────────────────────────────────────
@@ -197,6 +198,26 @@ def select_elasticnet(
 
 # ─── Pipeline completo ────────────────────────────────────────────────────────
 
+def _classify_feature_group(feat: str) -> str:
+    """Asignar grupo temático a una feature por su nombre."""
+    if any(k in feat for k in ("gestiones", "cant_rpc", "acuerdo", "promesas",
+                                "maximo_rank", "ratio_acuerdos", "tasa_rpc",
+                                "promesas_pct", "rank_norm")):
+        return "gestiones"
+    if any(k in feat for k in ("prop_debito", "canal_unico", "has_debito",
+                                "debito_exclusivo", "cv_debito")):
+        return "derivadas"
+    if any(k in feat for k in ("avg_pago_", "min_pago_", "max_pago_", "stddev_pago_")):
+        return "pagos"
+    if "mora" in feat:
+        return "moras"
+    if any(k in feat for k in ("excedente", "porc_pago", "sobrepago")):
+        return "excedentes"
+    if any(k in feat for k in ("trx_mnt", "trx_cnt")):
+        return "canales_resumen"
+    return "otros"
+
+
 def run_feature_selection(
     train_path: Path,
     output_dir: Path,
@@ -204,6 +225,7 @@ def run_feature_selection(
     anova_percentile: int   = _ANOVA_PERCENTILE,
     elasticnet_l1: float    = _EN_L1_RATIO,
     elasticnet_C: float     = _EN_C,
+    metrics_output: Path | None = None,
 ) -> list[str]:
     """Ejecutar el pipeline secuencial de selección sobre el conjunto de entrenamiento.
 
@@ -214,6 +236,8 @@ def run_feature_selection(
 
     Salidas en output_dir:
       - feature_cols.json: lista final de features seleccionadas.
+    Si metrics_output se especifica, escribe feature_selection_metrics.json con
+    conteos intermedios por paso y por grupo temático.
 
     Parameters
     ----------
@@ -222,12 +246,17 @@ def run_feature_selection(
     anova_percentile : int
     elasticnet_l1 : float
     elasticnet_C : float
+    metrics_output : Path | None
+        Ruta donde escribir el JSON de métricas. None = no escribir.
 
     Returns
     -------
     list[str]
         Features seleccionadas en el orden resultante del pipeline.
     """
+    import time as _time
+    t0 = _time.time()
+
     logger.info("Cargando train desde %s", train_path)
     df_train = pd.read_parquet(train_path)
     logger.info("Train: %d filas x %d cols", len(df_train), len(df_train.columns))
@@ -237,7 +266,9 @@ def run_feature_selection(
     y          = df_train[TARGET_COL].astype(int).to_numpy()
 
     # ── Paso 1: varianza / sparsity (no supervisado) ──────────────────────────
-    step1 = filter_low_variance(df_train, all_cands, var_threshold=var_threshold)
+    step1, removed_var, removed_sparse = filter_low_variance(
+        df_train, all_cands, var_threshold=var_threshold,
+    )
 
     # Construir X con las candidatas post-paso 1
     X1 = df_train[step1].fillna(0.0).to_numpy(dtype=np.float64)
@@ -263,6 +294,8 @@ def run_feature_selection(
     final = select_elasticnet(X2, y, step2, l1_ratio=elasticnet_l1, C=elasticnet_C)
     del X2
 
+    elapsed = round(_time.time() - t0, 1)
+
     # ── Guardar feature_cols.json ─────────────────────────────────────────────
     output_dir.mkdir(parents=True, exist_ok=True)
     feat_path = output_dir / "feature_cols.json"
@@ -273,6 +306,34 @@ def run_feature_selection(
         "Selección completada: %d candidatas → %d finales | %s",
         len(all_cands), len(final), feat_path,
     )
+
+    # ── Guardar métricas intermedias ──────────────────────────────────────────
+    if metrics_output is not None:
+        groups: dict[str, int] = {}
+        for f in final:
+            g = _classify_feature_group(f)
+            groups[g] = groups.get(g, 0) + 1
+
+        metrics = {
+            "cols_initial":            len(all_cands),
+            "cols_after_variance":     len(step1),
+            "removed_variance_var":    removed_var,
+            "removed_variance_sparse": removed_sparse,
+            "cols_after_anova":        len(step2),
+            "cols_removed_anova":      len(step1) - len(step2),
+            "cols_final":              len(final),
+            "cols_removed_elasticnet": len(step2) - len(final),
+            "var_threshold":           var_threshold,
+            "anova_percentile":        anova_percentile,
+            "elasticnet_l1":           elasticnet_l1,
+            "elasticnet_c":            elasticnet_C,
+            "time_sec":                elapsed,
+            "groups":                  groups,
+        }
+        with open(metrics_output, "w") as fh:
+            json.dump(metrics, fh, indent=2)
+        logger.info("Métricas de selección escritas en %s", metrics_output)
+
     return final
 
 
@@ -296,7 +357,17 @@ if __name__ == "__main__":
                         help=f"l1_ratio ElasticNet (default: {_EN_L1_RATIO})")
     parser.add_argument("--elasticnet-c",     type=float, default=_EN_C,
                         help=f"C ElasticNet — inverso regularización (default: {_EN_C})")
+    parser.add_argument(
+        "--metrics-output", default=None,
+        help="Ruta para feature_selection_metrics.json (default: <output-dir>/feature_selection_metrics.json)",
+    )
     args = parser.parse_args()
+
+    metrics_path = (
+        Path(args.metrics_output)
+        if args.metrics_output
+        else Path(args.output_dir) / "feature_selection_metrics.json"
+    )
 
     run_feature_selection(
         train_path       = Path(args.train_path),
@@ -305,4 +376,5 @@ if __name__ == "__main__":
         anova_percentile = args.anova_percentile,
         elasticnet_l1    = args.elasticnet_l1,
         elasticnet_C     = args.elasticnet_c,
+        metrics_output   = metrics_path,
     )

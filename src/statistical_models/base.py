@@ -220,6 +220,16 @@ class BaseDebitClassifier(ABC):
             return {}
         return self.model.get_params()
 
+    def get_training_history(self) -> dict | None:
+        """Devolver historial de métricas por iteración del entrenamiento, si está disponible.
+
+        Returns
+        -------
+        dict | None
+            Diccionario con arrays de métricas por paso, o None si no disponible.
+        """
+        return None
+
     def get_feature_importances(self) -> dict[str, float] | None:
         """Devolver importancia de features si el estimador la expone.
 

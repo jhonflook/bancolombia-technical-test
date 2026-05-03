@@ -155,7 +155,8 @@ select-features:
 		--var-threshold 0.01 \
 		--anova-percentile 80 \
 		--elasticnet-l1 0.7 \
-		--elasticnet-c 0.1
+		--elasticnet-c 0.1 \
+		--metrics-output data/artifacts/feature_selection_metrics.json
 
 select-features-strict:
 	uv run python -m src.dataset.feature_selection \
@@ -164,7 +165,8 @@ select-features-strict:
 		--var-threshold 0.05 \
 		--anova-percentile 70 \
 		--elasticnet-l1 1.0 \
-		--elasticnet-c 0.05
+		--elasticnet-c 0.05 \
+		--metrics-output data/artifacts/feature_selection_metrics.json
 
 select-features-custom:
 	uv run python -m src.dataset.feature_selection \
@@ -173,7 +175,8 @@ select-features-custom:
 		--var-threshold $(or $(VAR_THRESHOLD),0.01) \
 		--anova-percentile $(or $(ANOVA_PERCENTILE),80) \
 		--elasticnet-l1 $(or $(ELASTICNET_L1),0.7) \
-		--elasticnet-c $(or $(ELASTICNET_C),0.1)
+		--elasticnet-c $(or $(ELASTICNET_C),0.1) \
+		--metrics-output $(or $(METRICS_OUTPUT),data/artifacts/feature_selection_metrics.json)
 
 # =============================================================================
 # ENTRENAMIENTO — deploy/train_debit_classifier.py
@@ -311,6 +314,19 @@ export-shap-features-overwrite:
 		--sample 3000 \
 		--overwrite
 
+export-pipeline-metrics:
+	uv run python deploy/export_pipeline_metrics.py \
+		--datalake-path ./datalake \
+		--artifacts-dir data/artifacts \
+		--split-strategy random
+
+export-pipeline-metrics-overwrite:
+	uv run python deploy/export_pipeline_metrics.py \
+		--datalake-path ./datalake \
+		--artifacts-dir data/artifacts \
+		--split-strategy random \
+		--overwrite
+
 provision-metabase:
 	METABASE_URL=http://localhost:3000 \
 	METABASE_USER=admin@bancolombia.com \
@@ -332,6 +348,37 @@ provision-metabase-docker:
 	DEBIT_DB_PASS=debit \
 	DEBIT_DB_PORT=5432 \
 	uv run python deploy/metabase_provisioning.py
+
+# =============================================================================
+# DOCUMENTACIÓN — Slides de presentación
+# =============================================================================
+
+SLIDES_MD   = _docs/slides.md
+SLIDES_HTML = _docs/slides.html
+SLIDES_PDF  = _docs/slides.pdf
+
+slides-html:
+	docker run --rm \
+		-v "$(CURDIR)":/home/marp/app \
+		-e LANG=C.UTF-8 \
+		marpteam/marp-cli \
+		$(SLIDES_MD) --html --allow-local-files -o $(SLIDES_HTML)
+	@echo "HTML generado: $(SLIDES_HTML)"
+	xdg-open "$(CURDIR)/$(SLIDES_HTML)" 2>/dev/null || true
+
+slides-pdf: slides-html
+	google-chrome \
+		--headless=new \
+		--no-sandbox \
+		--disable-gpu \
+		--disable-dev-shm-usage \
+		--run-all-compositor-stages-before-draw \
+		--virtual-time-budget=5000 \
+		--print-to-pdf="$(CURDIR)/$(SLIDES_PDF)" \
+		--print-to-pdf-no-header \
+		--no-pdf-header-footer \
+		"file://$(CURDIR)/$(SLIDES_HTML)"
+	@echo "PDF generado: $(SLIDES_PDF)"
 
 # =============================================================================
 # DOCUMENTACIÓN — Diagrama de arquitectura
@@ -431,10 +478,14 @@ help:
 	@echo "  make scan-inf             Escanea inf en train/test/oot.parquet"
 	@echo ""
 	@echo "=== METABASE ==="
+	@echo "  make export-pipeline-metrics          Exporta métricas de preprocesamiento a debit_pipeline_metrics"
+	@echo "  make export-pipeline-metrics-overwrite  Ídem + elimina métricas previas del run"
 	@echo "  make provision-metabase        Provisiona desde localhost"
 	@echo "  make provision-metabase-docker Provisiona desde red Docker interna"
 	@echo ""
 	@echo "=== DOCUMENTACIÓN ==="
+	@echo "  make slides-html          Genera _docs/slides.html y lo abre en el navegador"
+	@echo "  make slides-pdf           Genera _docs/slides.pdf (requiere slides-html previo)"
 	@echo "  make diagram-pdf          Genera _docs/debit_architecture_diagram.pdf desde el HTML"
 	@echo ""
 	@echo "=== MIGRACIONES ==="
