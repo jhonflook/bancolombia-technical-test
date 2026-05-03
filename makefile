@@ -248,7 +248,12 @@ pipeline:
 		--split-strategy temporal
 	uv run python -m src.dataset.feature_selection \
 		--train-path data/artifacts/train.parquet \
-		--output-dir data/artifacts
+		--output-dir data/artifacts \
+		--var-threshold 0.01 \
+		--anova-percentile 80 \
+		--elasticnet-l1 0.7 \
+		--elasticnet-c 0.1 \
+		--metrics-output data/artifacts/feature_selection_metrics.json
 	uv run python deploy/train_debit_classifier.py \
 		--data-dir data/artifacts \
 		--mlflow-uri http://localhost:5000 \
@@ -261,7 +266,12 @@ pipeline-from-features:
 		--split-strategy temporal
 	uv run python -m src.dataset.feature_selection \
 		--train-path data/artifacts/train.parquet \
-		--output-dir data/artifacts
+		--output-dir data/artifacts \
+		--var-threshold 0.01 \
+		--anova-percentile 80 \
+		--elasticnet-l1 0.7 \
+		--elasticnet-c 0.1 \
+		--metrics-output data/artifacts/feature_selection_metrics.json
 	uv run python deploy/train_debit_classifier.py \
 		--data-dir data/artifacts \
 		--mlflow-uri http://localhost:5000 \
@@ -276,7 +286,17 @@ diag-random-split:
 		--input data/artifacts/analytical_model.parquet \
 		--output-dir data/artifacts \
 		--split-strategy random \
-		--random-state 42
+		--random-state 42 \
+		--train-size 0.477 \
+		--test-size 0.293
+	uv run python -m src.dataset.feature_selection \
+		--train-path data/artifacts/train.parquet \
+		--output-dir data/artifacts \
+		--var-threshold 0.01 \
+		--anova-percentile 80 \
+		--elasticnet-l1 0.7 \
+		--elasticnet-c 0.1 \
+		--metrics-output data/artifacts/feature_selection_metrics.json
 	uv run python deploy/train_debit_classifier.py \
 		--data-dir data/artifacts \
 		--mlflow-uri http://localhost:5000 \

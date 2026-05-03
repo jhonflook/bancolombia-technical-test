@@ -294,6 +294,23 @@ _QUESTIONS: list[tuple[str, str, str]] = [
         """,
         "bar",
     ),
+    (
+        "17. Última Fecha de Carga de Datos",
+        """
+        SELECT MAX(run_date) AT TIME ZONE 'America/Bogota' AS ultima_carga_datos
+        FROM debit_pipeline_metrics
+        WHERE stage = 'loader'
+        """,
+        "scalar",
+    ),
+    (
+        "18. Última Fecha de Entrenamiento",
+        """
+        SELECT MAX(run_date) AT TIME ZONE 'America/Bogota' AS ultimo_entrenamiento
+        FROM debit_model_metrics
+        """,
+        "scalar",
+    ),
 ]
 
 
@@ -311,6 +328,13 @@ def _post(url: str, payload: dict, token: str = "") -> dict:
     if token:
         headers["X-Metabase-Session"] = token
     resp = requests.post(url, json=payload, headers=headers, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _put(url: str, payload: dict, token: str) -> dict:
+    headers = {"Content-Type": "application/json", "X-Metabase-Session": token}
+    resp = requests.put(url, json=payload, headers=headers, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
@@ -422,32 +446,31 @@ def _find_card(title: str, token: str) -> int | None:
 
 
 def create_question(title: str, sql: str, viz_type: str, db_id: int, token: str) -> int:
-    """Crear (o reusar) una question nativa SQL.
+    """Crear o actualizar una question nativa SQL.
 
     Returns
     -------
     int
         ID de la card.
     """
+    payload = {
+        "name":          title,
+        "display":       viz_type,
+        "dataset_query": {
+            "database": db_id,
+            "type":     "native",
+            "native":   {"query": sql.strip()},
+        },
+        "visualization_settings": {},
+    }
+
     existing = _find_card(title, token)
     if existing:
-        logger.info("Card '%s' ya existe (id=%d).", title, existing)
+        _put(f"{METABASE_URL}/api/card/{existing}", payload, token)
+        logger.info("Card '%s' actualizada (id=%d).", title, existing)
         return existing
 
-    result  = _post(
-        f"{METABASE_URL}/api/card",
-        {
-            "name":          title,
-            "display":       viz_type,
-            "dataset_query": {
-                "database": db_id,
-                "type":     "native",
-                "native":   {"query": sql.strip()},
-            },
-            "visualization_settings": {},
-        },
-        token,
-    )
+    result  = _post(f"{METABASE_URL}/api/card", payload, token)
     cid = int(result["id"])
     logger.info("Card '%s' creada (id=%d).", title, cid)
     return cid

@@ -18,7 +18,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-EXPERIMENT_NAME = "debit_recurrence_classifier"
+EXPERIMENT_NAME = "debit-models"
 DEFAULT_METRIC = "test_auc_roc"
 
 

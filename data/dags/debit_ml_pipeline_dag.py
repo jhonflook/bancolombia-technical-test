@@ -335,9 +335,10 @@ with DAG(
         task_id="train_model",
         image=IMAGE,
         command=(
-            "uv run python -m src.services.training "
+            "uv run python deploy/train_debit_classifier.py "
             "--data-dir /app/data/artifacts "
-            "--mlflow-uri http://mlflow:5000"
+            "--mlflow-uri http://mlflow:5000 "
+            "--n-trials 5"
         ),
         docker_url=DOCKER_URL,
         network_mode=NETWORK,
@@ -347,9 +348,9 @@ with DAG(
         mount_tmp_dir=False,
         execution_timeout=timedelta(hours=2),
         doc_md=(
-            "Entrena XGBoost binario con corrección por desbalance (scale_pos_weight, S8). "
-            "Métricas: AUC-ROC (primaria, S8), KS, Precision/Recall@0.5 y @umbral KS, AUC-PR. "
-            "Artefactos: model_xgboost.pkl, feature_importance.csv → MLflow run."
+            "Entrena xgboost + gradient_boosting + logistic_regression con Optuna (5 trials). "
+            "Métricas: AUC-ROC (primaria, S8), KS, Precision/Recall, Brier, log_loss. "
+            "Artefactos: model_*.pkl, 12 figuras/run (ROC, PR, SHAP, calibración, etc.) → MLflow."
         ),
     )
 

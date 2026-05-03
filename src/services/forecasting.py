@@ -19,12 +19,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.database.connections import engine
-
 logger = logging.getLogger(__name__)
 
 JOIN_KEYS = ["num_doc", "obl17", "f_analisis"]
-SCORE_TABLE = "debit_scores"
 MORA_COL_6M = "moras_avg_mora_6m"
 
 
@@ -184,33 +181,6 @@ class DebitScoringService:
             logger.info("Scores guardados en %s", output_path)
 
         return scores
-
-    def save_scores_to_db(
-        self,
-        scores: pd.DataFrame,
-        if_exists: str = "append",
-    ) -> None:
-        """Persistir scores en tabla debit_scores de PostgreSQL.
-
-        Parameters
-        ----------
-        scores : pd.DataFrame
-            Scores generados por score().
-        if_exists : str
-            'append' (default) o 'replace' — pasado a pandas.to_sql().
-        """
-        scores.to_sql(
-            SCORE_TABLE,
-            con=engine,
-            if_exists=if_exists,
-            index=False,
-            method="multi",
-        )
-        logger.info(
-            "Scores persistidos en '%s' | n=%d filas",
-            SCORE_TABLE, len(scores),
-        )
-
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
