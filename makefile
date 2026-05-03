@@ -288,6 +288,17 @@ export-model-metrics-overwrite:
 		--top-features 50 \
 		--overwrite
 
+export-shap-features:
+	uv run python deploy/export_shap_features.py \
+		--top-features 50 \
+		--sample 3000
+
+export-shap-features-overwrite:
+	uv run python deploy/export_shap_features.py \
+		--top-features 50 \
+		--sample 3000 \
+		--overwrite
+
 provision-metabase:
 	METABASE_URL=http://localhost:3000 \
 	METABASE_USER=admin@bancolombia.com \

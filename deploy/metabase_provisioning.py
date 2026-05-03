@@ -85,71 +85,45 @@ _QUESTIONS: list[tuple[str, str, str]] = [
         "pie",
     ),
     (
-        "4. Mora Promedio 6m por Clase y Período",
+        "4. Mix de Canales de Pago por Clase",
         """
-        SELECT periodo,
-               MAX(CASE WHEN clase = 0 THEN avg_mora_6m END) AS mora_clase0,
-               MAX(CASE WHEN clase = 1 THEN avg_mora_6m END) AS mora_clase1
-        FROM v_debit_mora_profile
-        GROUP BY periodo
-        ORDER BY periodo
-        """,
-        "line",
-    ),
-    (
-        "5. Mix de Canales de Pago por Clase",
-        """
-        SELECT clase,
-               ROUND(AVG(avg_debito_6m),  4) AS debito_6m,
-               ROUND(AVG(avg_fisico_6m),  4) AS fisico_6m,
-               ROUND(AVG(avg_virtual_6m), 4) AS virtual_6m,
-               ROUND(AVG(avg_otros_6m),   4) AS otros_6m
-        FROM v_debit_payment_mix
-        GROUP BY clase
-        ORDER BY clase
+        SELECT clase::text,
+               canal,
+               ROUND(avg_pago::numeric, 4) AS avg_pago_6m
+        FROM (
+            SELECT clase, 'debito'  AS canal, AVG(avg_debito_6m)  AS avg_pago FROM v_debit_payment_mix GROUP BY clase
+            UNION ALL
+            SELECT clase, 'fisico'  AS canal, AVG(avg_fisico_6m)  AS avg_pago FROM v_debit_payment_mix GROUP BY clase
+            UNION ALL
+            SELECT clase, 'virtual' AS canal, AVG(avg_virtual_6m) AS avg_pago FROM v_debit_payment_mix GROUP BY clase
+            UNION ALL
+            SELECT clase, 'otros'   AS canal, AVG(avg_otros_6m)   AS avg_pago FROM v_debit_payment_mix GROUP BY clase
+        ) t
+        ORDER BY clase, canal
         """,
         "bar",
     ),
     (
-        "6. Efectividad de Gestiones de Cobranza por Clase",
+        "5. Efectividad de Gestiones de Cobranza por Clase",
         """
-        SELECT clase,
-               ROUND(AVG(avg_gestiones_6m),          3) AS gestiones,
-               ROUND(AVG(avg_rpc_6m),                3) AS rpc,
-               ROUND(AVG(avg_acuerdos_6m),           3) AS acuerdos,
-               ROUND(AVG(avg_promesas_cumplidas_6m),  3) AS promesas_cumplidas
-        FROM v_debit_gestiones_profile
-        GROUP BY clase
-        ORDER BY clase
+        SELECT clase::text,
+               metrica,
+               ROUND(valor::numeric, 3) AS valor_promedio
+        FROM (
+            SELECT clase, 'gestiones'         AS metrica, AVG(avg_gestiones_6m)         AS valor FROM v_debit_gestiones_profile GROUP BY clase
+            UNION ALL
+            SELECT clase, 'rpc'               AS metrica, AVG(avg_rpc_6m)               AS valor FROM v_debit_gestiones_profile GROUP BY clase
+            UNION ALL
+            SELECT clase, 'acuerdos'          AS metrica, AVG(avg_acuerdos_6m)          AS valor FROM v_debit_gestiones_profile GROUP BY clase
+            UNION ALL
+            SELECT clase, 'promesas_cumplidas' AS metrica, AVG(avg_promesas_cumplidas_6m) AS valor FROM v_debit_gestiones_profile GROUP BY clase
+        ) t
+        ORDER BY clase, metrica
         """,
         "bar",
     ),
     (
-        "7. Porcentaje de Pago sobre Cuota por Período",
-        """
-        SELECT periodo,
-               MAX(CASE WHEN clase = 0 THEN avg_porc_pago_6m END) AS pct_pago_clase0,
-               MAX(CASE WHEN clase = 1 THEN avg_porc_pago_6m END) AS pct_pago_clase1
-        FROM v_debit_excedentes_profile
-        GROUP BY periodo
-        ORDER BY periodo
-        """,
-        "line",
-    ),
-    (
-        "8. Actividad Transaccional por Clase y Período",
-        """
-        SELECT periodo,
-               MAX(CASE WHEN clase = 0 THEN pct_con_actividad END) AS actividad_clase0,
-               MAX(CASE WHEN clase = 1 THEN pct_con_actividad END) AS actividad_clase1
-        FROM v_debit_canal_activity
-        GROUP BY periodo
-        ORDER BY periodo
-        """,
-        "line",
-    ),
-    (
-        "9. Segmentos de Cobranza por Período",
+        "6. Segmentos de Cobranza por Período",
         """
         SELECT periodo, segmento_cobranza, n_obligaciones, pct_del_total
         FROM v_debit_risk_segment_summary
@@ -158,7 +132,7 @@ _QUESTIONS: list[tuple[str, str, str]] = [
         "bar",
     ),
     (
-        "10. KPI Resumen — Último Período",
+        "7. KPI Resumen — Último Período",
         """
         SELECT periodo, total_obligaciones, pct_clase1, pct_clase0
         FROM v_debit_kpi_period
@@ -168,7 +142,7 @@ _QUESTIONS: list[tuple[str, str, str]] = [
         "scalar",
     ),
     (
-        "11. Comparativa AUC y KS por Modelo",
+        "8. Comparativa AUC y KS por Modelo",
         """
         SELECT model_name,
                split_strategy,
@@ -184,7 +158,7 @@ _QUESTIONS: list[tuple[str, str, str]] = [
         "table",
     ),
     (
-        "12. Estabilidad Train vs Test vs OOT por Modelo",
+        "9. Estabilidad Train vs Test vs OOT por Modelo",
         """
         SELECT model_name,
                ROUND(train_auc::numeric, 4) AS train_auc,
@@ -197,18 +171,24 @@ _QUESTIONS: list[tuple[str, str, str]] = [
         "bar",
     ),
     (
-        "13. Top 20 Features por Importancia",
+        "10. Top 20 Features por Modelo",
         """
-        SELECT f.model_name,
-               f.feature_name,
-               ROUND(f.importance::numeric, 6) AS importance,
-               f.rank
-        FROM debit_model_features f
-        INNER JOIN (
-            SELECT run_id FROM debit_model_metrics ORDER BY test_auc DESC LIMIT 1
-        ) best ON f.run_id = best.run_id
-        WHERE f.rank <= 20
-        ORDER BY f.rank
+        SELECT model_name,
+               feature_name,
+               rank,
+               ROUND(
+                   (
+                       (importance - MIN(importance) OVER (PARTITION BY model_name)) /
+                       NULLIF(
+                           MAX(importance) OVER (PARTITION BY model_name)
+                           - MIN(importance) OVER (PARTITION BY model_name),
+                           0
+                       )
+                   )::numeric
+               , 4) AS importance_norm
+        FROM debit_model_features
+        WHERE rank <= 20
+        ORDER BY model_name, rank
         """,
         "bar",
     ),
@@ -381,7 +361,9 @@ def _find_dashboard(name: str, token: str) -> int | None:
 
 
 def create_dashboard(card_ids: list[int], token: str) -> int:
-    """Crear dashboard con las cards en layout 2 columnas (12 cols c/u, 8 filas c/u).
+    """Crear (o actualizar) dashboard con las cards en layout 2 columnas.
+
+    Siempre sincroniza el conjunto completo de cards aunque el dashboard ya exista.
 
     Returns
     -------
@@ -390,26 +372,26 @@ def create_dashboard(card_ids: list[int], token: str) -> int:
     """
     existing = _find_dashboard(DASHBOARD_NAME, token)
     if existing:
-        logger.info("Dashboard '%s' ya existe (id=%d).", DASHBOARD_NAME, existing)
-        return existing
-
-    result  = _post(
-        f"{METABASE_URL}/api/dashboard",
-        {
-            "name":        DASHBOARD_NAME,
-            "description": "Tablero analítico de débitos recurrentes — mora temprana 1-30 días.",
-        },
-        token,
-    )
-    dash_id = int(result["id"])
-    logger.info("Dashboard creado (id=%d).", dash_id)
+        dash_id = existing
+        logger.info("Dashboard '%s' ya existe (id=%d) — actualizando cards.", DASHBOARD_NAME, dash_id)
+    else:
+        result = _post(
+            f"{METABASE_URL}/api/dashboard",
+            {
+                "name":        DASHBOARD_NAME,
+                "description": "Tablero analítico de débitos recurrentes — mora temprana 1-30 días.",
+            },
+            token,
+        )
+        dash_id = int(result["id"])
+        logger.info("Dashboard creado (id=%d).", dash_id)
 
     cards_payload = []
     for idx, cid in enumerate(card_ids):
         col = (idx % 2) * 12
         row = (idx // 2) * 8
         cards_payload.append({
-            "id":                      -(idx + 1),  # ID temporal negativo para cards nuevas
+            "id":                      -(idx + 1),
             "card_id":                 cid,
             "col":                     col,
             "row":                     row,
@@ -426,7 +408,7 @@ def create_dashboard(card_ids: list[int], token: str) -> int:
         timeout=30,
     )
     resp.raise_for_status()
-    logger.info("%d cards añadidas al dashboard id=%d.", len(card_ids), dash_id)
+    logger.info("%d cards sincronizadas en dashboard id=%d.", len(card_ids), dash_id)
 
     return dash_id
 
