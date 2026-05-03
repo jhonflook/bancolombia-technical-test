@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 METABASE_URL  = os.getenv("METABASE_URL",  "http://metabase:3000")
 MB_USER       = os.getenv("METABASE_USER", "admin@bancolombia.com")
-MB_PASS       = os.getenv("METABASE_PASS", "admin123")
+MB_PASS       = os.getenv("METABASE_PASS", "Debit2026!Bancolombia")
 
 DB_HOST       = os.getenv("DEBIT_DB_HOST", "postgres")
 DB_NAME       = os.getenv("DEBIT_DB_NAME", "debitdb")
@@ -166,6 +166,51 @@ _QUESTIONS: list[tuple[str, str, str]] = [
         LIMIT 1
         """,
         "scalar",
+    ),
+    (
+        "11. Comparativa AUC y KS por Modelo",
+        """
+        SELECT model_name,
+               split_strategy,
+               ROUND(cv_auc::numeric,    4) AS cv_auc,
+               ROUND(train_auc::numeric, 4) AS train_auc,
+               ROUND(test_auc::numeric,  4) AS test_auc,
+               ROUND(oot_auc::numeric,   4) AS oot_auc,
+               ROUND(test_ks::numeric,   4) AS test_ks,
+               ROUND(oot_ks::numeric,    4) AS oot_ks
+        FROM debit_model_metrics
+        ORDER BY test_auc DESC
+        """,
+        "table",
+    ),
+    (
+        "12. Estabilidad Train vs Test vs OOT por Modelo",
+        """
+        SELECT model_name,
+               ROUND(train_auc::numeric, 4) AS train_auc,
+               ROUND(test_auc::numeric,  4) AS test_auc,
+               ROUND(oot_auc::numeric,   4) AS oot_auc,
+               ROUND((train_auc - oot_auc)::numeric, 4) AS degradacion_auc
+        FROM debit_model_metrics
+        ORDER BY model_name
+        """,
+        "bar",
+    ),
+    (
+        "13. Top 20 Features por Importancia",
+        """
+        SELECT f.model_name,
+               f.feature_name,
+               ROUND(f.importance::numeric, 6) AS importance,
+               f.rank
+        FROM debit_model_features f
+        INNER JOIN (
+            SELECT run_id FROM debit_model_metrics ORDER BY test_auc DESC LIMIT 1
+        ) best ON f.run_id = best.run_id
+        WHERE f.rank <= 20
+        ORDER BY f.rank
+        """,
+        "bar",
     ),
 ]
 
@@ -359,15 +404,29 @@ def create_dashboard(card_ids: list[int], token: str) -> int:
     dash_id = int(result["id"])
     logger.info("Dashboard creado (id=%d).", dash_id)
 
+    cards_payload = []
     for idx, cid in enumerate(card_ids):
         col = (idx % 2) * 12
         row = (idx // 2) * 8
-        _post(
-            f"{METABASE_URL}/api/dashboard/{dash_id}/cards",
-            {"cardId": cid, "col": col, "row": row, "size_x": 12, "size_y": 8},
-            token,
-        )
-        logger.info("Card id=%d añadida (col=%d, row=%d).", cid, col, row)
+        cards_payload.append({
+            "id":                      -(idx + 1),  # ID temporal negativo para cards nuevas
+            "card_id":                 cid,
+            "col":                     col,
+            "row":                     row,
+            "size_x":                  12,
+            "size_y":                  8,
+            "parameter_mappings":      [],
+            "visualization_settings":  {},
+        })
+
+    resp = requests.put(
+        f"{METABASE_URL}/api/dashboard/{dash_id}/cards",
+        json={"cards": cards_payload},
+        headers={"Content-Type": "application/json", "X-Metabase-Session": token},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    logger.info("%d cards añadidas al dashboard id=%d.", len(card_ids), dash_id)
 
     return dash_id
 
@@ -384,8 +443,16 @@ def run_provisioning() -> None:
     except Exception:
         logger.info("Primera ejecución — configurando instancia nueva...")
         setup_new_instance("")
-        time.sleep(5)
-        token = get_session_token()
+        # Esperar a que Metabase procese el setup y habilite el login
+        for i in range(1, 13):
+            time.sleep(10)
+            try:
+                token = get_session_token()
+                break
+            except Exception:
+                logger.info("Esperando activación post-setup... %d/12", i)
+        else:
+            raise RuntimeError("No se pudo autenticar tras el setup de Metabase.")
 
     db_id    = get_or_create_database(token)
     card_ids = [create_question(t, sql, viz, db_id, token) for t, sql, viz in _QUESTIONS]

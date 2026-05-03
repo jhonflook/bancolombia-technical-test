@@ -277,14 +277,25 @@ scan-inf:
 #       DEBIT_DB_HOST, DEBIT_DB_NAME, DEBIT_DB_USER, DEBIT_DB_PASS, DEBIT_DB_PORT
 # =============================================================================
 
+export-model-metrics:
+	uv run python deploy/export_model_metrics.py \
+		--mlflow-uri http://localhost:5000 \
+		--top-features 50
+
+export-model-metrics-overwrite:
+	uv run python deploy/export_model_metrics.py \
+		--mlflow-uri http://localhost:5000 \
+		--top-features 50 \
+		--overwrite
+
 provision-metabase:
 	METABASE_URL=http://localhost:3000 \
 	METABASE_USER=admin@bancolombia.com \
-	METABASE_PASS=admin123 \
-	DEBIT_DB_HOST=localhost \
+	METABASE_PASS=Debit2026!Bancolombia \
+	DEBIT_DB_HOST=postgres \
 	DEBIT_DB_NAME=debitdb \
-	DEBIT_DB_USER=debit \
-	DEBIT_DB_PASS=debit \
+	DEBIT_DB_USER=fredy \
+	DEBIT_DB_PASS=password \
 	DEBIT_DB_PORT=5432 \
 	uv run python deploy/metabase_provisioning.py
 
