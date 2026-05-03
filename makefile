@@ -15,6 +15,18 @@ logs:
 	docker compose logs -f
 
 # =============================================================================
+# IMÁGENES DOCKER
+# =============================================================================
+
+build-ml:
+	docker build -f deploy/Dockerfile -t debit-ml:latest .
+
+build-airflow:
+	docker compose build airflow-webserver airflow-scheduler airflow-init
+
+build-all: build-ml build-airflow
+
+# =============================================================================
 # AIRFLOW — apache/airflow:2.8.1-python3.11 / localhost:8080
 # Primera vez: make airflow-init  (inicializa BD + crea usuario admin)
 # Arranque normal: make airflow-up
@@ -322,6 +334,27 @@ provision-metabase-docker:
 	uv run python deploy/metabase_provisioning.py
 
 # =============================================================================
+# DOCUMENTACIÓN — Diagrama de arquitectura
+# =============================================================================
+
+DIAGRAM_HTML = _docs/debit_architecture_diagram.html
+DIAGRAM_PDF  = _docs/debit_architecture_diagram.pdf
+
+diagram-pdf:
+	google-chrome \
+		--headless=new \
+		--no-sandbox \
+		--disable-gpu \
+		--disable-dev-shm-usage \
+		--run-all-compositor-stages-before-draw \
+		--virtual-time-budget=8000 \
+		--print-to-pdf="$(CURDIR)/$(DIAGRAM_PDF)" \
+		--print-to-pdf-no-header \
+		--no-pdf-header-footer \
+		"file://$(CURDIR)/$(DIAGRAM_HTML)"
+	@echo "PDF generado: $(DIAGRAM_PDF)"
+
+# =============================================================================
 # MIGRACIONES — Alembic
 # =============================================================================
 
@@ -339,6 +372,11 @@ migrate-history:
 # =============================================================================
 
 help:
+	@echo ""
+	@echo "=== IMÁGENES DOCKER ==="
+	@echo "  make build-ml             Construye debit-ml:latest (deploy/Dockerfile)"
+	@echo "  make build-airflow        Construye debit-airflow:latest (deploy/Dockerfile.airflow)"
+	@echo "  make build-all            Construye ambas imágenes"
 	@echo ""
 	@echo "=== INFRAESTRUCTURA ==="
 	@echo "  make up                   Levanta postgres + mlflow"
@@ -395,6 +433,9 @@ help:
 	@echo "=== METABASE ==="
 	@echo "  make provision-metabase        Provisiona desde localhost"
 	@echo "  make provision-metabase-docker Provisiona desde red Docker interna"
+	@echo ""
+	@echo "=== DOCUMENTACIÓN ==="
+	@echo "  make diagram-pdf          Genera _docs/debit_architecture_diagram.pdf desde el HTML"
 	@echo ""
 	@echo "=== MIGRACIONES ==="
 	@echo "  make migrate              alembic upgrade head"
