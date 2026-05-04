@@ -121,6 +121,22 @@ Grupos finales: `gestiones` · `pagos` · `derivadas` · `canales_resumen` · `m
 | 🟠 **C — Cobranza suave** | `var_rta=0` y `mora_6m ≤ 15 días` | Gestión ligera |
 | 🔴 **D — Cobranza intensiva** | `var_rta=0` y `mora_6m > 15 días` | Gestión activa |
 
+### Criterio de los umbrales — justificación operativa
+
+Los umbrales de `mora_6m` son **supuestos de diseño operativo** (complementan S8), no derivados estadísticamente. Se sustentan en la naturaleza de la cartera (mora temprana 1–30 días) y en el diferente costo de error según el segmento:
+
+**¿Por qué 10 días para los segmentos A y B (clase 1)?**
+
+`mora_6m` es el promedio de días de mora en los últimos 6 meses. Un cliente con `var_rta=1` (paga exclusivamente por débito, recurrencia ≥ 40 %) y `mora_6m ≤ 10 días` muestra que sus retrasos históricos son **incidentales** — fondos momentáneamente insuficientes o delays bancarios, no un problema estructural de capacidad de pago. La combinación canal automático + historial de mora bajo hace que la recuperación sea prácticamente segura sin intervención humana.
+
+El umbral es **intencionalmente estricto en 10 días** (no 15) porque el segmento A elimina completamente la gestión humana: un error tiene costo operativo alto. Los clientes con `var_rta=1` y mora entre 10–30 días siguen teniendo el canal correcto, pero su historial de mora más alto sugiere que el débito por sí solo puede no ser suficiente → se monitoran preventivamente (segmento B).
+
+**¿Por qué 15 días para los segmentos C y D (clase 0)?**
+
+La clase 0 equivale a **sin actividad de pago** en el período (Hallazgo H1) — todos estos clientes requieren gestión humana. El umbral de 15 días separa mora "temprana leve" (gestión suave, posible recuperación rápida) de mora más avanzada dentro del rango 1–30 días (gestión intensiva). El corte es más permisivo que 10 días porque aquí la variable relevante es la **intensidad** de la gestión, no si se gestiona o no.
+
+> **Resumen del diseño:** el umbral de 10 días para clase 1 maximiza la certeza antes de desactivar la gestión humana; el umbral de 15 días para clase 0 calibra el esfuerzo entre gestión suave e intensiva.
+
 ---
 
 ## 📈 Dashboard Metabase

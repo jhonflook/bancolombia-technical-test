@@ -153,10 +153,16 @@ Desbalance **3.7:1** → estratificación + `class_weight` en todos los modelos.
 
 | Segmento | Criterio | Acción | Impacto |
 |----------|----------|--------|---------|
-| **A — Automatizar** | `var_rta=1` y mora ≤ 10 días | **Sin gestión humana** | Ahorro máximo de costos |
-| **B — Monitorear** | `var_rta=1` y mora > 10 días | Seguimiento ligero | Reducción parcial de costos |
-| **C — Cobranza suave** | `var_rta=0` y mora ≤ 15 días | Contacto preventivo | Gestión focalizada |
-| **D — Cobranza intensiva** | `var_rta=0` y mora > 15 días | Gestión activa | Máximo esfuerzo |
+| **A — Automatizar** | `var_rta=1` y `mora_6m` ≤ 10 días | **Sin gestión humana** | Ahorro máximo de costos |
+| **B — Monitorear** | `var_rta=1` y `mora_6m` > 10 días | Seguimiento ligero | Reducción parcial de costos |
+| **C — Cobranza suave** | `var_rta=0` y `mora_6m` ≤ 15 días | Contacto preventivo | Gestión focalizada |
+| **D — Cobranza intensiva** | `var_rta=0` y `mora_6m` > 15 días | Gestión activa | Máximo esfuerzo |
+
+**Criterio de los umbrales — supuestos de diseño operativo** (la cartera cubre mora temprana 1–30 días):
+
+- **10 días — clase 1:** `mora_6m` ≤ 10 días indica retrasos **incidentales** (fondos momentáneos, delay bancario), no estructurales. Canal automático + historial bajo = automatización de bajo riesgo. Umbral estricto porque el Segmento A elimina completamente la gestión humana — el costo de un error es alto.
+- **> 10 días — clase 1 → Segmento B:** el débito existe pero la mora histórica mayor sugiere que el débito por sí solo puede no ser suficiente → monitoreo preventivo.
+- **15 días — clase 0:** estos clientes no tienen actividad de pago (H1) y siempre requieren gestión. El umbral de 15 días calibra la **intensidad** (suave vs. intensiva), no si se gestiona o no. Más permisivo que 10 días porque el error solo cambia la intensidad, no si hay intervención.
 
 > **Palanca clave:** el modelo predice `var_rta` con AUC = 0.96 → permite **concentrar el 100 % del esfuerzo humano en Segmentos C y D**, que representan el 21.2 % de la cartera.
 
