@@ -2,8 +2,9 @@
 
 > **Prueba Técnica · Cargo: Analítico III**
 >
-> 👤 **Jhon Fredy Correa Gomez** · Economista · Científico de Datos - Analista
-> 📧 jonfredi12@gmail.com · 🔗 [linkedin.com/in/jhoncorrgo](https://www.linkedin.com/in/jhoncorrgo/)
+> 👤 **Jhon Fredy Correa Gomez** · Economista · Científico de Datos
+> 📧 jonfredi12@gmail.com · 
+> 🔗 [linkedin.com/in/jhoncorrgo](https://www.linkedin.com/in/jhoncorrgo/)
 
 📎 **Documentos del proyecto:**
 &nbsp;&nbsp;📄 [Diagrama de Arquitectura (PDF)](./_docs/debit_architecture_diagram.pdf)
