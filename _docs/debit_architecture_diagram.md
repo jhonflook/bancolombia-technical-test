@@ -562,3 +562,152 @@ flowchart TB
 | ORM | SQLModel + SQLAlchemy | Modelos de datos y migraciones |
 | Migraciones | Alembic | Schema versioning — 5 migraciones aplicadas |
 | Parametrización | `split_strategy` × `feature_set` | 4 configuraciones: A/B × random/temporal |
+
+---
+
+## Hallazgos Críticos del EDA
+
+```mermaid
+flowchart TB
+    subgraph H1["H1 — Hallazgo más importante"]
+        direction LR
+        C0["Clase 0 (9,901 obs)"]
+        C0Pay["total_pago = 0\nen TODOS los canales\ny TODAS las ventanas"]
+        C0 --> C0Pay
+    end
+
+    subgraph Implication1["Implicación H1"]
+        I1A["var_rta=0 ≠ 'pagó por otro canal'"]
+        I1B["var_rta=0 = 'sin actividad de pago'"]
+        I1A --> I1B
+    end
+
+    subgraph H2["H2 — Ventana temporal"]
+        V1["14.9% clase-1 con pagos físico/virtual en 3m"]
+        V2["var_rta calculado en f_analisis puntual\ntanque promedia los 3m previos"]
+        V1 --> V2
+    end
+
+    subgraph H4["H4 — Estructura del dataset"]
+        T1["97.9% obligaciones\nen único f_analisis"]
+        T2["Dataset casi transversal\nno longitudinal"]
+        T3["Split temporal segmenta\ncohortes distintas"]
+        T1 --> T2 --> T3
+    end
+
+    subgraph Diagnosis["Diagnóstico AUC = 1.0"]
+        D1["H1 + H4 interactúan"]
+        D2["Split temporal concentra\nclase-0 en Test/OOT"]
+        D3["Features débito discriminan\ntrivialmente → AUC = 1.0"]
+        D4["Split aleatorio → AUC = 0.96\n(valor real del modelo)"]
+        D1 --> D2 --> D3 --> D4
+    end
+
+    H1 --> Implication1
+    Implication1 --> Diagnosis
+    H4 --> Diagnosis
+```
+
+---
+
+## Resultados del Modelo — Métricas Clave
+
+```mermaid
+flowchart LR
+    subgraph OptionA["Opción A — Producción (60 features)"]
+        direction TB
+        GBM_A["Gradient Boosting ⭐\nCV AUC: 0.9616\nTest AUC: 0.9620\nOOT AUC: 0.9616\nKS Test: 0.7379"]
+        XGB_A["XGBoost\nCV AUC: 0.9587\nTest AUC: 0.9594\nOOT AUC: 0.9580\nKS Test: 0.7300"]
+        LR_A["Logistic Regression\nCV AUC: 0.9548\nTest AUC: 0.9537\nOOT AUC: 0.9530\nKS Test: 0.7100"]
+    end
+
+    subgraph OptionB["Opción B — Sin historial (19 features)"]
+        direction TB
+        GBM_B["Gradient Boosting\nTest AUC: ~0.8875"]
+        XGB_B["XGBoost\nTest AUC: ~0.87"]
+        LR_B["Logistic Regression\nTest AUC: ~0.84"]
+    end
+
+    subgraph Stability["Estabilidad — sin sobreajuste"]
+        ST["Train ≈ Test ≈ OOT\nen todas las configuraciones"]
+    end
+
+    subgraph TopFeature["Top Feature (SHAP)"]
+        TF["prop_debito_3m\nimportance = 8.68\n(proporción de pagos\npor débito en 3 meses)"]
+    end
+
+    GBM_A --> Stability
+    GBM_B --> Stability
+    Stability --> TopFeature
+```
+
+---
+
+## Flujo de Valor — Impacto en Cobranza
+
+```mermaid
+flowchart TB
+    subgraph Input["Entrada — Cartera en Mora Temprana (1–30 días)"]
+        Cartera["45,731 obligaciones\n(universo analizado)"]
+    end
+
+    subgraph Model["Modelo de Clasificación\nGradient Boosting · AUC = 0.96"]
+        Scoring["DebitScoringService\nscore() → P(var_rta=1)"]
+    end
+
+    subgraph Segments["Segmentación Operativa"]
+        SegA["SEGMENTO A\n~35% de la cartera\nvar_rta=1 · mora ≤ 10d\n→ AUTOMATIZAR\nSin gestión humana"]
+        SegB["SEGMENTO B\n~44% de la cartera\nvar_rta=1 · mora > 10d\n→ MONITOREAR\nSeguimiento ligero"]
+        SegC["SEGMENTO C\n~10% de la cartera\nvar_rta=0 · mora ≤ 15d\n→ COBRANZA SUAVE\nContacto preventivo"]
+        SegD["SEGMENTO D\n~11% de la cartera\nvar_rta=0 · mora > 15d\n→ COBRANZA INTENSIVA\nGestión activa"]
+    end
+
+    subgraph Impact["Impacto Operativo"]
+        Auto["~79% del volumen\nsin costo de gestión"]
+        Focus["Gestión humana\nfocalizada en C+D\n(~21% del volumen)"]
+    end
+
+    Cartera --> Scoring
+    Scoring --> SegA
+    Scoring --> SegB
+    Scoring --> SegC
+    Scoring --> SegD
+    SegA --> Auto
+    SegB --> Auto
+    SegC --> Focus
+    SegD --> Focus
+```
+
+---
+
+## Conclusiones y Accionables de Negocio
+
+```mermaid
+flowchart TB
+    subgraph Findings["Conclusiones Técnicas"]
+        F1["✅ Modelo válido y robusto\nAUC=0.96 · KS=0.74\nTrain≈Test≈OOT"]
+        F2["✅ H1 — hallazgo crítico\nClase-0 = sin actividad de pago\nRedefine objetivo del modelo"]
+        F3["✅ Selección supervisada confirma EDA\npago_fisico y pago_otros\neliminados automáticamente por ANOVA"]
+        F4["✅ Diagnóstico transparente\nAUC=1.0 temporal = causa estructural\nno sobreajuste ni leakage"]
+        F5["✅ Opción B agrega valor\nAUC=0.88 solo con gestiones+moras\nComportamiento de cobranza predice el pago"]
+    end
+
+    subgraph Actions["Accionables Inmediatos"]
+        A1["🔴 Alta prioridad\nActivar Segmento A\nDesactivar gestión humana"]
+        A2["🔴 Alta prioridad\nAjustar umbral operativo\nsegún costo-beneficio real"]
+        A3["🟡 Media prioridad\nDesplegar Opción B\npara clientes sin historial"]
+        A4["🟡 Media prioridad\nMonitoreo automático\nPSI mensual sobre prop_debito_3m"]
+        A5["🟢 Normal\nRe-entrenamiento automático\nsi AUC OOT < 0.90"]
+    end
+
+    subgraph Requirements["Requerimientos Cumplidos"]
+        R1["R1 ✅ Modelo de datos analítico\n(num_doc, obl17, f_analisis)"]
+        R2["R2 ✅ Pipeline escalable\nAirflow DAG @monthly"]
+        R3["R3 ✅ Split Train/Test/OOT\nJustificado + diagnóstico resuelto"]
+        R4["R4 ✅ AUC=0.96 + KS + P/R/F1\n+ Brier + Calibración + SHAP"]
+        R5["R5 ✅ Dashboard Metabase\n18 cards · accionables de negocio"]
+    end
+
+    Findings --> Actions
+    Actions --> Requirements
+```
