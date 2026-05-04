@@ -222,13 +222,38 @@ train-random-split:
 		--n-trials 5 \
 		--split-strategy random
 
+train-option-b:
+	uv run python deploy/train_debit_classifier.py \
+		--data-dir data/artifacts \
+		--mlflow-uri http://localhost:5000 \
+		--n-trials 5 \
+		--feature-set B \
+		--split-strategy random
+
+train-both-options:
+	uv run python deploy/train_debit_classifier.py \
+		--data-dir data/artifacts \
+		--mlflow-uri http://localhost:5000 \
+		--n-trials 5 \
+		--feature-set both \
+		--split-strategy random
+
+train-both-temporal:
+	uv run python deploy/train_debit_classifier.py \
+		--data-dir data/artifacts \
+		--mlflow-uri http://localhost:5000 \
+		--n-trials 5 \
+		--feature-set both \
+		--split-strategy temporal
+
 train-custom:
 	uv run python deploy/train_debit_classifier.py \
 		--data-dir $(or $(DATA_DIR),data/artifacts) \
 		--mlflow-uri $(or $(MLFLOW_URI),http://localhost:5000) \
 		--n-trials $(or $(N_TRIALS),5) \
 		--models $(or $(MODELS),xgboost gradient_boosting logistic_regression) \
-		--split-strategy $(or $(SPLIT_STRATEGY),temporal)
+		--split-strategy $(or $(SPLIT_STRATEGY),random) \
+		--feature-set $(or $(FEATURE_SET),A)
 
 # =============================================================================
 # PIPELINE COMPLETO — secuencia T1→T2→T3→T3.5→T4
@@ -330,21 +355,38 @@ export-shap-features:
 
 export-shap-features-overwrite:
 	uv run python deploy/export_shap_features.py \
+		--feature-set A \
 		--top-features 50 \
 		--sample 3000 \
 		--overwrite
+
+export-shap-features-option-b-overwrite:
+	uv run python deploy/export_shap_features.py \
+		--feature-set B \
+		--top-features 50 \
+		--sample 3000 \
+		--overwrite
+
+export-shap-all-overwrite: export-shap-features-overwrite export-shap-features-option-b-overwrite
 
 export-pipeline-metrics:
 	uv run python deploy/export_pipeline_metrics.py \
 		--datalake-path ./datalake \
 		--artifacts-dir data/artifacts \
-		--split-strategy random
+		--split-strategy $(or $(SPLIT_STRATEGY),random)
 
 export-pipeline-metrics-overwrite:
 	uv run python deploy/export_pipeline_metrics.py \
 		--datalake-path ./datalake \
 		--artifacts-dir data/artifacts \
-		--split-strategy random \
+		--split-strategy $(or $(SPLIT_STRATEGY),random) \
+		--overwrite
+
+export-pipeline-metrics-temporal-overwrite:
+	uv run python deploy/export_pipeline_metrics.py \
+		--datalake-path ./datalake \
+		--artifacts-dir data/artifacts \
+		--split-strategy temporal \
 		--overwrite
 
 provision-metabase:
@@ -361,11 +403,11 @@ provision-metabase:
 provision-metabase-docker:
 	METABASE_URL=http://metabase:3000 \
 	METABASE_USER=admin@bancolombia.com \
-	METABASE_PASS=admin123 \
+	METABASE_PASS=Debit2026!Bancolombia \
 	DEBIT_DB_HOST=postgres \
 	DEBIT_DB_NAME=debitdb \
-	DEBIT_DB_USER=debit \
-	DEBIT_DB_PASS=debit \
+	DEBIT_DB_USER=fredy \
+	DEBIT_DB_PASS=password \
 	DEBIT_DB_PORT=5432 \
 	uv run python deploy/metabase_provisioning.py
 

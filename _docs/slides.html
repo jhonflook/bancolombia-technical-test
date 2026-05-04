@@ -1468,7 +1468,7 @@ section::after { font-size: 13px; color: #999; }
 <th>Partición</th>
 <th>Rango temporal</th>
 <th>Periodos</th>
-<th>Filas</th>
+<th>Filas (producción)</th>
 </tr>
 </thead>
 <tbody>
@@ -1476,24 +1476,25 @@ section::after { font-size: 13px; color: #999; }
 <td><strong>Train</strong></td>
 <td>2024-07 → 2025-02</td>
 <td>8</td>
-<td>22,291</td>
+<td>22,293</td>
 </tr>
 <tr>
 <td><strong>Test</strong></td>
 <td>2025-03 → 2025-07</td>
 <td>5</td>
-<td>13,712</td>
+<td>13,693</td>
 </tr>
 <tr>
 <td><strong>OOT</strong></td>
 <td>2025-08 → 2025-11</td>
 <td>4</td>
-<td>10,733</td>
+<td>10,750</td>
 </tr>
 </tbody>
 </table>
 <blockquote>
-<p><strong>Hallazgo clave:</strong> 97.9 % de obligaciones aparece en un único <code>f_analisis</code> — el dataset es casi <strong>transversal</strong>, no longitudinal. El split segmenta <strong>cohortes distintas</strong>, no evolución de la misma obligación.</p>
+<p><strong>Hallazgo clave:</strong> 97.9 % de obligaciones aparece en un único <code>f_analisis</code> — el dataset es casi <strong>transversal</strong>, no longitudinal. El split segmenta <strong>cohortes distintas</strong>, no evolución de la misma obligación.<br />
+<strong>Split de producción:</strong> estratificado aleatorio (S13) — Train ≈ Test ≈ OOT en distribución de clases. Ver Sección 6.</p>
 </blockquote>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="12" data-paginate="true" data-class="section-title" data-theme="default" data-style=":root {
@@ -2561,13 +2562,14 @@ section::after { font-size: 13px; color: #999; }
 <pre is="marp-pre" data-auto-scaling="downscale-only"><code>240 candidatas
    │
    ▼ Varianza / Sparsity (umbral 0.01)
- 166 features  (−74)
+ 191 features  (−49)
    │
    ▼ ANOVA F-test (p-valor &lt; 0.05 ajustado)
- 132 features  (−34)
+ 152 features  (−39)
    │
    ▼ ElasticNet L1/L2  (l1_ratio=0.7, C=0.1)
- 116 features finales  (−16)
+  60 features finales — Opción A (incluye débito)
+  19 features finales — Opción B (solo gestiones + moras)
 </code></pre>
 <blockquote>
 <p><code>pago_fisico</code> y <code>pago_otros</code> <strong>eliminados</strong> por ANOVA → confirma H1.<br />
@@ -3334,7 +3336,7 @@ pre code { background: transparent; color: #F8F8F2; padding: 0; border-radius: 0
 footer { font-size: 13px; color: #999; }
 section::after { font-size: 13px; color: #999; }
 ;" data-marpit-pagination-total="35">
-<h2 id="decisi%C3%B3n--opci%C3%B3n-a-mantenida">Decisión — Opción A (mantenida)</h2>
+<h2 id="decisi%C3%B3n--opciones-a-y-b-implementadas">Decisión — Opciones A y B implementadas</h2>
 <table>
 <thead>
 <tr>
@@ -3347,26 +3349,28 @@ section::after { font-size: 13px; color: #999; }
 <tbody>
 <tr>
 <td><strong>A <img class="emoji" draggable="false" alt="✅" src="https://cdn.jsdelivr.net/gh/jdecked/twemoji@17.0.2/assets/svg/2705.svg" data-marp-twemoji=""/></strong></td>
-<td>Todas (incluye débito)</td>
+<td>60 features (incluye débito)</td>
 <td><strong>~0.96</strong></td>
-<td>Clientes con historial de pagos</td>
+<td>Cartera con historial de pagos</td>
 </tr>
 <tr>
-<td>B</td>
-<td>Sin features de débito</td>
-<td>~0.80</td>
-<td>Clientes nuevos / sin historial</td>
+<td><strong>B <img class="emoji" draggable="false" alt="✅" src="https://cdn.jsdelivr.net/gh/jdecked/twemoji@17.0.2/assets/svg/2705.svg" data-marp-twemoji=""/></strong></td>
+<td>19 features (gestiones + moras)</td>
+<td><strong>~0.88</strong></td>
+<td>Clientes sin historial de débito</td>
 </tr>
 <tr>
 <td>C</td>
-<td>Dos modelos (A + B)</td>
+<td>Dos modelos en paralelo (A + B)</td>
 <td>mixto</td>
 <td>Mayor cobertura, más complejidad</td>
 </tr>
 </tbody>
 </table>
 <blockquote>
-<p><strong>Decisión adoptada:</strong> Opción A. El historial de débito está disponible en producción para la cartera analizada. AUC real = <strong>0.96</strong> — excelente discriminación.</p>
+<p><strong>Opción A:</strong> historial de débito disponible en producción → AUC = <strong>0.96</strong>.<br />
+<strong>Opción B:</strong> sin features de débito → AUC = <strong>0.88</strong>, robusto ante clientes nuevos.<br />
+Ambas opciones están entrenadas y disponibles en MLflow (<code>feature_set = A / B</code>).</p>
 </blockquote>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="26" data-paginate="true" data-class="section-title" data-theme="default" data-style=":root {
@@ -3594,7 +3598,7 @@ pre code { background: transparent; color: #F8F8F2; padding: 0; border-radius: 0
 footer { font-size: 13px; color: #999; }
 section::after { font-size: 13px; color: #999; }
 ;" data-marpit-pagination-total="35">
-<h2 id="10-cards-en-metabase--httplocalhost3000dashboard4">10 cards en Metabase — <code>http://localhost:3000/dashboard/4</code></h2>
+<h2 id="18-cards-en-metabase--httplocalhost3000dashboard4">18 cards en Metabase — <code>http://localhost:3000/dashboard/4</code></h2>
 <table>
 <thead>
 <tr>
@@ -3661,9 +3665,57 @@ section::after { font-size: 13px; color: #999; }
 </tr>
 <tr>
 <td>10</td>
-<td>Top 20 Features por Modelo</td>
+<td>Top 20 Features por Modelo (SHAP)</td>
 <td>Barras</td>
 <td><code>debit_model_features</code></td>
+</tr>
+<tr>
+<td>11</td>
+<td>Retención de Datos en Carga por Fuente</td>
+<td>Barras</td>
+<td><code>v_debit_pipeline_load_summary</code></td>
+</tr>
+<tr>
+<td>12</td>
+<td>Duplicados Eliminados en Carga</td>
+<td>Barras</td>
+<td><code>v_debit_pipeline_load_summary</code></td>
+</tr>
+<tr>
+<td>13</td>
+<td>Funnel de Selección de Features</td>
+<td>Barras</td>
+<td><code>v_debit_pipeline_feature_funnel</code></td>
+</tr>
+<tr>
+<td>14</td>
+<td>Dimensiones Train / Test / OOT</td>
+<td>Tabla</td>
+<td><code>v_debit_pipeline_splits</code></td>
+</tr>
+<tr>
+<td>15</td>
+<td>Balance de Clases por Partición</td>
+<td>Barras</td>
+<td><code>v_debit_pipeline_splits</code></td>
+</tr>
+<tr>
+<td>16</td>
+<td>Features Seleccionadas por Grupo Temático</td>
+<td>Barras</td>
+<td><code>debit_pipeline_metrics</code></td>
+</tr>
+<tr>
+<td>17</td>
+<td>Última Fecha de Carga de Datos</td>
+<td>Escalar</td>
+<td><code>debit_pipeline_metrics</code></td>
+</tr>
+<tr>
+<td>18</td>
+<td>Última Fecha de Entrenamiento</td>
+<td>Escalar</td>
+<td><code>debit_model_metrics</code></td>
 </tr>
 </tbody>
 </table>
@@ -3902,14 +3954,15 @@ gate_build_model ──► build_analytical_model (JOIN 6 fuentes)
      │
 gate_build_features ──► build_features (~240 cols → parquets)
      │
-gate_select_features ──► select_features (116 features finales)
+gate_select_features ──► select_features (60 / 19 features finales)
      │
 gate_train ──► train_model (XGBoost + GBM + LogReg + MLflow)
      │
-gate_metabase ──► provision_metabase (10 cards idempotente)
+gate_metabase ──► provision_metabase (18 cards idempotente)
 </code></pre>
 <p><strong>Cada gate</strong> es un <code>ShortCircuitOperator</code> configurable desde <code>.env</code> o al disparar el DAG.<br />
-<strong>Cada tarea</strong> corre como <code>DockerOperator</code> sobre <code>debit-network</code>.</p>
+<strong>Cada tarea</strong> corre como <code>DockerOperator</code> sobre <code>debit-network</code>.<br />
+<strong>Parámetros del DAG:</strong> <code>split_strategy</code> (random/temporal) · <code>feature_set</code> (A/B/both).</p>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="30" data-paginate="true" data-theme="default" data-style=":root {
   --color-yellow: #FFD100;
@@ -4288,7 +4341,7 @@ section::after { font-size: 13px; color: #999; }
 </tr>
 <tr>
 <td><strong>Observabilidad</strong></td>
-<td>MLflow tracking + 10 cards Metabase</td>
+<td>MLflow tracking + 18 cards Metabase</td>
 </tr>
 <tr>
 <td><strong>Diagnóstico transparente</strong></td>
@@ -4553,11 +4606,11 @@ section::after { font-size: 13px; color: #999; }
 ;" data-marpit-pagination-total="35">
 <h2 id="pr%C3%B3ximos-pasos">Próximos pasos</h2>
 <ol>
-<li><strong>Modelo sin historial (Opción B):</strong> entrenar excluyendo features de débito → cobertura en clientes nuevos</li>
-<li><strong>Umbral operativo:</strong> ajustar punto de corte según costo de gestión vs. falso negativo</li>
-<li><strong>Monitoreo de drift:</strong> PSI mensual sobre distribución de <code>prop_debito_3m</code> y score</li>
+<li><strong>Umbral operativo:</strong> ajustar punto de corte (actualmente KS-óptimo) según costo de gestión vs. falso negativo</li>
+<li><strong>Monitoreo de drift:</strong> PSI mensual sobre <code>prop_debito_3m</code> y score del modelo</li>
 <li><strong>Re-entrenamiento automático:</strong> trigger en DAG si AUC OOT &lt; 0.90</li>
-<li><strong>ALERTA 3 pendiente:</strong> aumentar <code>max_iter</code> en LogisticRegression para convergencia</li>
+<li><strong>Convergencia LogisticRegression:</strong> aumentar <code>max_iter</code> para resolver ALERTA 3 (<code>ConvergenceWarning</code>)</li>
+<li><strong>Despliegue dual A/B:</strong> orquestar scoring con Opción A para cartera activa y Opción B para clientes sin historial</li>
 </ol>
 </section>
 </foreignObject></svg><svg data-marpit-svg="" viewBox="0 0 1280 720"><foreignObject width="1280" height="720"><section id="35" data-paginate="true" data-class="cover" data-theme="default" data-style=":root {

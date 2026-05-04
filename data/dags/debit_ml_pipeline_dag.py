@@ -58,9 +58,16 @@ IMAGE = "debit-ml:latest"
 NETWORK = "debit_network"
 DOCKER_URL = "unix://var/run/docker.sock"
 
+POSTGRES_USER = os.environ.get("POSTGRES_USER", "fredy")
+POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "password")
+POSTGRES_DB = os.environ.get("POSTGRES_DB", "debitdb")
+
 CONTAINER_ENV = {
     "POSTGRES_HOST": "postgres",
     "MLFLOW_TRACKING_URI": "http://mlflow:5000",
+    "POSTGRES_USER": POSTGRES_USER,
+    "POSTGRES_PASSWORD": POSTGRES_PASSWORD,
+    "POSTGRES_DB": POSTGRES_DB,
 }
 
 DATALAKE_MOUNT = Mount(
@@ -82,6 +89,11 @@ ARTIFACTS_MOUNT = Mount(
 def _env_bool(var: str, default: bool = True) -> bool:
     """Lee una variable de entorno como booleano (1/true/yes → True)."""
     return os.getenv(var, str(default)).lower().strip() in ("1", "true", "yes")
+
+
+def _env_str(var: str, default: str) -> str:
+    """Lee una variable de entorno como string."""
+    return os.getenv(var, default)
 
 
 def _gate_callable(param_name: str):
@@ -128,6 +140,18 @@ DAG_PARAMS = {
         default=_env_bool("RUN_METABASE"),
         type="boolean",
         description="T5: provisionamiento tablero Metabase",
+    ),
+    "split_strategy": Param(
+        default=_env_str("SPLIT_STRATEGY", "random"),
+        type="string",
+        enum=["random", "temporal"],
+        description="Estrategia de split: 'random' (producción) o 'temporal' (cohortes)",
+    ),
+    "feature_set": Param(
+        default=_env_str("FEATURE_SET", "A"),
+        type="string",
+        enum=["A", "B", "both"],
+        description="Opción A: todas las features. B: sin pagos/excedentes/canales. both: entrena ambas.",
     ),
 }
 
@@ -283,14 +307,15 @@ with DAG(
         ),
     )
 
-    # ── T3: Feature engineering + split temporal ──────────────────────────
+    # ── T3: Feature engineering + split ──────────────────────────────────
     build_features = DockerOperator(
         task_id="build_features",
         image=IMAGE,
         command=(
             "uv run python -m src.dataset.feature_engineering "
             "--input /app/data/artifacts/analytical_model.parquet "
-            "--output-dir /app/data/artifacts"
+            "--output-dir /app/data/artifacts "
+            "--split-strategy {{ params.split_strategy }}"
         ),
         docker_url=DOCKER_URL,
         network_mode=NETWORK,
@@ -338,7 +363,9 @@ with DAG(
             "uv run python deploy/train_debit_classifier.py "
             "--data-dir /app/data/artifacts "
             "--mlflow-uri http://mlflow:5000 "
-            "--n-trials 5"
+            "--n-trials 5 "
+            "--split-strategy {{ params.split_strategy }} "
+            "--feature-set {{ params.feature_set }}"
         ),
         docker_url=DOCKER_URL,
         network_mode=NETWORK,
@@ -365,16 +392,16 @@ with DAG(
             **CONTAINER_ENV,
             "METABASE_URL":  "http://metabase:3000",
             "METABASE_USER": "admin@bancolombia.com",
-            "METABASE_PASS": "admin123",
+            "METABASE_PASS": "Debit2026!Bancolombia",
             "DEBIT_DB_HOST": "postgres",
-            "DEBIT_DB_NAME": "debitdb",
-            "DEBIT_DB_USER": "debit",
-            "DEBIT_DB_PASS": "debit",
+            "DEBIT_DB_NAME": POSTGRES_DB,
+            "DEBIT_DB_USER": POSTGRES_USER,
+            "DEBIT_DB_PASS": POSTGRES_PASSWORD,
         },
         auto_remove="force",
         mount_tmp_dir=False,
         doc_md=(
-            "Provisiona el tablero Metabase con 10 preguntas analíticas de negocio "
+            "Provisiona el tablero Metabase con preguntas analíticas de negocio "
             "basadas en las vistas v_debit_* de PostgreSQL. "
             "Segmentos: A=Automatizar, B=Monitorear, C=Cobranza suave, D=Cobranza intensiva."
         ),

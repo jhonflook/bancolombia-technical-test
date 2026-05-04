@@ -58,20 +58,30 @@ def _parse_args() -> argparse.Namespace:
         "--overwrite", action="store_true",
         help="Reemplaza registros existentes del run en debit_model_features",
     )
+    p.add_argument(
+        "--feature-set",
+        default="A",
+        choices=["A", "B"],
+        help=(
+            "Conjunto de features del run a procesar (A = todas, B = sin pago/excedentes/canales). "
+            "Selecciona el PKL y el run_id correspondientes. Default: 'A'"
+        ),
+    )
     return p.parse_args()
 
 
-def _get_run_id(model_name: str) -> str | None:
-    """Devuelve el run_id más reciente del modelo en debit_model_metrics."""
+def _get_run_info(model_name: str, feature_set: str = "A") -> tuple[str, str] | None:
+    """Devuelve (run_id, split_strategy) más reciente para el modelo y feature_set dados."""
     with engine.connect() as conn:
         row = conn.execute(
             text(
-                "SELECT run_id FROM debit_model_metrics "
-                "WHERE model_name = :mn ORDER BY run_date DESC LIMIT 1"
+                "SELECT run_id, split_strategy FROM debit_model_metrics "
+                "WHERE model_name = :mn AND feature_set = :fs "
+                "ORDER BY run_date DESC LIMIT 1"
             ),
-            {"mn": model_name},
+            {"mn": model_name, "fs": feature_set},
         ).fetchone()
-    return row[0] if row else None
+    return (row[0], row[1]) if row else None
 
 
 def _compute_shap(
@@ -130,20 +140,27 @@ def _process_model(
     top_features: int,
     sample_n: int,
     overwrite: bool,
+    feature_set: str = "A",
 ) -> bool:
     """Calcula SHAP para un modelo y escribe en debit_model_features. Devuelve True si OK."""
-    pkl_path = f"{ARTIFACTS_DIR}/model_{model_name}.pkl"
+    # PKL con sufijo de feature_set (ej. model_xgboost_A.pkl).
+    # Retroceso a model_{name}.pkl para backward compat con runs anteriores a la parametrización.
+    import os
+    pkl_path = f"{ARTIFACTS_DIR}/model_{model_name}_{feature_set}.pkl"
+    if not os.path.exists(pkl_path) and feature_set == "A":
+        pkl_path = f"{ARTIFACTS_DIR}/model_{model_name}.pkl"
 
-    run_id = _get_run_id(model_name)
-    if run_id is None:
+    run_info = _get_run_info(model_name, feature_set)
+    if run_info is None:
         logger.warning(
-            "[%s] No se encontró run en debit_model_metrics. "
+            "[%s] No se encontró run en debit_model_metrics para feature_set=%s. "
             "Ejecuta primero: make export-model-metrics",
-            model_name,
+            model_name, feature_set,
         )
         return False
 
-    logger.info("[%s] run_id=%s", model_name, run_id[:8])
+    run_id, split_strategy = run_info
+    logger.info("[%s] run_id=%s | split_strategy=%s", model_name, run_id[:8], split_strategy)
 
     with engine.connect() as conn:
         exists = conn.execute(
@@ -189,11 +206,13 @@ def _process_model(
 
     rows = [
         {
-            "run_id":       run_id,
-            "model_name":   model_name,
-            "feature_name": row["feature"],
-            "importance":   float(row["importance"]),
-            "rank":         int(row["rank"]),
+            "run_id":         run_id,
+            "model_name":     model_name,
+            "feature_name":   row["feature"],
+            "importance":     float(row["importance"]),
+            "rank":           int(row["rank"]),
+            "feature_set":    feature_set,
+            "split_strategy": split_strategy,
         }
         for _, row in importance_df.iterrows()
     ]
@@ -220,6 +239,7 @@ def main() -> None:
 
     model_names = _DEFAULT_MODELS if args.model_name == "all" else [args.model_name]
 
+    logger.info("Feature set: %s | Modelos: %s", args.feature_set, model_names)
     success, failed = [], []
     for name in model_names:
         ok = _process_model(
@@ -228,12 +248,13 @@ def main() -> None:
             top_features=args.top_features,
             sample_n=args.sample,
             overwrite=args.overwrite,
+            feature_set=args.feature_set,
         )
         (success if ok else failed).append(name)
 
     logger.info(
-        "Completado: %d OK %s | %d fallidos %s",
-        len(success), success, len(failed), failed,
+        "Completado [feature_set=%s]: %d OK %s | %d fallidos %s",
+        args.feature_set, len(success), success, len(failed), failed,
     )
 
 

@@ -6,6 +6,18 @@ WINDOWS_FULL = ["3m", "6m", "9m", "12m"]
 WINDOWS_MORA = ["3m", "6m", "9m"]  # S6: moras no tiene ventana 12m
 STATS = ["avg", "min", "max", "stddev"]
 
+# Opción B (H1): grupos cuya señal es determinista porque clase-0 = cero actividad
+# de pago en todos los canales y ventanas (pagos, excedentes, canales).
+# Solo sobreviven gestiones + moras, que capturan cobranza independientemente del pago.
+OPTION_B_EXCLUDE_GROUPS = [
+    "pagos",
+    "derived_pagos",
+    "excedentes",
+    "derived_excedentes",
+    "canales_summary",
+    "derived_canales",
+]
+
 
 @dataclass
 class DebitFeatureConfig:
@@ -129,6 +141,19 @@ class DebitFeatureConfig:
     def all_features(self) -> list[str]:
         """Catálogo completo: base + derivadas."""
         return self.all_base_features() + self.all_derived_features()
+
+    def features_option_b(self) -> list[str]:
+        """Features Opción B: excluye grupos deterministas por H1 (clase-0 = sin pago).
+
+        Retiene solo gestiones y moras, que capturan comportamiento de cobranza
+        independientemente de si el cliente tiene actividad de pago registrada.
+        """
+        exclude = set(
+            feat
+            for g in OPTION_B_EXCLUDE_GROUPS
+            for feat in self.get_group(g)
+        )
+        return [f for f in self.all_features() if f not in exclude]
 
     def get_group(self, group: str) -> list[str]:
         """Retornar features de un grupo específico.

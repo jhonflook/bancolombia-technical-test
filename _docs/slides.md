@@ -201,13 +201,14 @@ T5: metabase_provisioning.py → Dashboard id=4
 
 ## Particionamiento Train / Test / OOT
 
-| Partición | Rango temporal | Periodos | Filas |
-|-----------|---------------|----------|-------|
-| **Train** | 2024-07 → 2025-02 | 8 | 22,291 |
-| **Test** | 2025-03 → 2025-07 | 5 | 13,712 |
-| **OOT** | 2025-08 → 2025-11 | 4 | 10,733 |
+| Partición | Rango temporal | Periodos | Filas (producción) |
+|-----------|---------------|----------|--------------------|
+| **Train** | 2024-07 → 2025-02 | 8 | 22,293 |
+| **Test** | 2025-03 → 2025-07 | 5 | 13,693 |
+| **OOT** | 2025-08 → 2025-11 | 4 | 10,750 |
 
 > **Hallazgo clave:** 97.9 % de obligaciones aparece en un único `f_analisis` — el dataset es casi **transversal**, no longitudinal. El split segmenta **cohortes distintas**, no evolución de la misma obligación.
+> **Split de producción:** estratificado aleatorio (S13) — Train ≈ Test ≈ OOT en distribución de clases. Ver Sección 6.
 
 ---
 
@@ -306,13 +307,14 @@ El archivo `canales` tiene **4,258 columnas**. Se descartaron 4,252 granulares; 
 240 candidatas
    │
    ▼ Varianza / Sparsity (umbral 0.01)
- 166 features  (−74)
+ 191 features  (−49)
    │
    ▼ ANOVA F-test (p-valor < 0.05 ajustado)
- 132 features  (−34)
+ 152 features  (−39)
    │
    ▼ ElasticNet L1/L2  (l1_ratio=0.7, C=0.1)
- 116 features finales  (−16)
+  60 features finales — Opción A (incluye débito)
+  19 features finales — Opción B (solo gestiones + moras)
 ```
 
 > `pago_fisico` y `pago_otros` **eliminados** por ANOVA → confirma H1.
@@ -379,15 +381,17 @@ Las features de débito discriminan trivialmente a clase-0 → separación perfe
 
 ---
 
-## Decisión — Opción A (mantenida)
+## Decisión — Opciones A y B implementadas
 
 | Opción | Features | AUC real | Uso en producción |
 |--------|----------|----------|-------------------|
-| **A ✅** | Todas (incluye débito) | **~0.96** | Clientes con historial de pagos |
-| B | Sin features de débito | ~0.80 | Clientes nuevos / sin historial |
-| C | Dos modelos (A + B) | mixto | Mayor cobertura, más complejidad |
+| **A ✅** | 60 features (incluye débito) | **~0.96** | Cartera con historial de pagos |
+| **B ✅** | 19 features (gestiones + moras) | **~0.88** | Clientes sin historial de débito |
+| C | Dos modelos en paralelo (A + B) | mixto | Mayor cobertura, más complejidad |
 
-> **Decisión adoptada:** Opción A. El historial de débito está disponible en producción para la cartera analizada. AUC real = **0.96** — excelente discriminación.
+> **Opción A:** historial de débito disponible en producción → AUC = **0.96**.
+> **Opción B:** sin features de débito → AUC = **0.88**, robusto ante clientes nuevos.
+> Ambas opciones están entrenadas y disponibles en MLflow (`feature_set = A / B`).
 
 ---
 
@@ -398,7 +402,7 @@ Tablero Metabase — análisis descriptivo
 
 ---
 
-## 10 cards en Metabase — `http://localhost:3000/dashboard/4`
+## 18 cards en Metabase — `http://localhost:3000/dashboard/4`
 
 | # | Card | Tipo | Fuente |
 |---|------|------|--------|
@@ -411,7 +415,15 @@ Tablero Metabase — análisis descriptivo
 | 7 | KPI Resumen — Último Período | Escalar | `v_debit_kpi_period` |
 | 8 | Comparativa AUC y KS por Modelo | Tabla | `debit_model_metrics` |
 | 9 | Estabilidad Train/Test/OOT por Modelo | Barras | `debit_model_metrics` |
-| 10 | Top 20 Features por Modelo | Barras | `debit_model_features` |
+| 10 | Top 20 Features por Modelo (SHAP) | Barras | `debit_model_features` |
+| 11 | Retención de Datos en Carga por Fuente | Barras | `v_debit_pipeline_load_summary` |
+| 12 | Duplicados Eliminados en Carga | Barras | `v_debit_pipeline_load_summary` |
+| 13 | Funnel de Selección de Features | Barras | `v_debit_pipeline_feature_funnel` |
+| 14 | Dimensiones Train / Test / OOT | Tabla | `v_debit_pipeline_splits` |
+| 15 | Balance de Clases por Partición | Barras | `v_debit_pipeline_splits` |
+| 16 | Features Seleccionadas por Grupo Temático | Barras | `debit_pipeline_metrics` |
+| 17 | Última Fecha de Carga de Datos | Escalar | `debit_pipeline_metrics` |
+| 18 | Última Fecha de Entrenamiento | Escalar | `debit_model_metrics` |
 
 ---
 
@@ -433,15 +445,16 @@ gate_build_model ──► build_analytical_model (JOIN 6 fuentes)
      │
 gate_build_features ──► build_features (~240 cols → parquets)
      │
-gate_select_features ──► select_features (116 features finales)
+gate_select_features ──► select_features (60 / 19 features finales)
      │
 gate_train ──► train_model (XGBoost + GBM + LogReg + MLflow)
      │
-gate_metabase ──► provision_metabase (10 cards idempotente)
+gate_metabase ──► provision_metabase (18 cards idempotente)
 ```
 
 **Cada gate** es un `ShortCircuitOperator` configurable desde `.env` o al disparar el DAG.
 **Cada tarea** corre como `DockerOperator` sobre `debit-network`.
+**Parámetros del DAG:** `split_strategy` (random/temporal) · `feature_set` (A/B/both).
 
 ---
 
@@ -480,7 +493,7 @@ Resultados, supuestos y próximos pasos
 | **Estabilidad** | Train ≈ Test ≈ OOT (sin degradación) |
 | **Pipeline end-to-end** | CSV → PostgreSQL → Parquets → PKL → Metabase |
 | **Orquestación** | Airflow DAG con gates configurables |
-| **Observabilidad** | MLflow tracking + 10 cards Metabase |
+| **Observabilidad** | MLflow tracking + 18 cards Metabase |
 | **Diagnóstico transparente** | Alerta AUC=1.0 identificada, explicada y resuelta |
 
 ---
@@ -499,11 +512,11 @@ Resultados, supuestos y próximos pasos
 
 ## Próximos pasos
 
-1. **Modelo sin historial (Opción B):** entrenar excluyendo features de débito → cobertura en clientes nuevos
-2. **Umbral operativo:** ajustar punto de corte según costo de gestión vs. falso negativo
-3. **Monitoreo de drift:** PSI mensual sobre distribución de `prop_debito_3m` y score
-4. **Re-entrenamiento automático:** trigger en DAG si AUC OOT < 0.90
-5. **ALERTA 3 pendiente:** aumentar `max_iter` en LogisticRegression para convergencia
+1. **Umbral operativo:** ajustar punto de corte (actualmente KS-óptimo) según costo de gestión vs. falso negativo
+2. **Monitoreo de drift:** PSI mensual sobre `prop_debito_3m` y score del modelo
+3. **Re-entrenamiento automático:** trigger en DAG si AUC OOT < 0.90
+4. **Convergencia LogisticRegression:** aumentar `max_iter` para resolver ALERTA 3 (`ConvergenceWarning`)
+5. **Despliegue dual A/B:** orquestar scoring con Opción A para cartera activa y Opción B para clientes sin historial
 
 ---
 

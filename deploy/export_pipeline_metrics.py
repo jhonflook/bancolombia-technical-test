@@ -104,18 +104,23 @@ def _rows_to_df(rows: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _write_metrics(rows: list[dict], run_id: str, overwrite: bool) -> None:
+def _write_metrics(rows: list[dict], run_id: str, split_strategy: str, overwrite: bool) -> None:
     if not rows:
         return
     df = _rows_to_df(rows)
     with engine.begin() as conn:
         if overwrite:
+            # Borrar TODAS las filas de esta estrategia (no solo el run_id)
+            # para que re-ejecutar el mismo split_strategy reemplace la observación anterior.
             conn.execute(
-                text("DELETE FROM debit_pipeline_metrics WHERE run_id = :rid"),
-                {"rid": run_id},
+                text("DELETE FROM debit_pipeline_metrics WHERE split_strategy = :ss"),
+                {"ss": split_strategy},
             )
         df.to_sql("debit_pipeline_metrics", conn, if_exists="append", index=False)
-    logger.info("Escritas %d métricas para run_id=%s", len(rows), run_id[:20])
+    logger.info(
+        "Escritas %d métricas | run_id=%s | split_strategy=%s",
+        len(rows), run_id[:20], split_strategy,
+    )
 
 
 def _make_row(run_id, run_date, split_strategy, stage, source_name, metric_name, metric_value):
@@ -451,7 +456,7 @@ def main() -> None:
         logger.error("No se generaron métricas. Verifica las rutas de artefactos.")
         return
 
-    _write_metrics(all_rows, run_id, args.overwrite)
+    _write_metrics(all_rows, run_id, args.split_strategy, args.overwrite)
     logger.info("Total métricas escritas: %d | run_id=%s", len(all_rows), run_id)
 
 

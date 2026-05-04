@@ -94,7 +94,7 @@ flowchart LR
 
     subgraph Selection["Selección de Features"]
         FeatSel["feature_selection.py<br/>varianza → ANOVA → ElasticNet"]
-        FeatCols["feature_cols.json<br/>(116 features)"]
+        FeatCols["feature_cols.json<br/>(60 features — Opción A)"]
     end
 
     subgraph Training["Entrenamiento ML"]
@@ -105,9 +105,11 @@ flowchart LR
 
     subgraph Export["Exportación Métricas"]
         ExportMetrics["export_model_metrics.py"]
-        ExportSHAP["export_shap_features.py<br/>(TreeExplainer, 3k muestras)"]
+        ExportSHAP["export_shap_features.py<br/>(TreeExplainer XGB/GBM + LinearExplainer LR)"]
+        ExportPipeline["export_pipeline_metrics.py<br/>(103 métricas — 4 etapas)"]
         ModelMetrics["debit_model_metrics"]
-        ModelFeatures["debit_model_features<br/>(150 filas)"]
+        ModelFeatures["debit_model_features<br/>(50 features × 3 modelos × N configs)"]
+        PipelineMetrics["debit_pipeline_metrics"]
     end
 
     subgraph Viz["Visualización"]
@@ -156,11 +158,15 @@ flowchart LR
     ExportMetrics --> ModelMetrics
     ExportMetrics --> ModelFeatures
     ExportSHAP --> ModelFeatures
+    FeatSel --> ExportPipeline
+    AnalyticalModel --> ExportPipeline
+    ExportPipeline --> PipelineMetrics
 
     TClient --> Views
     TPago --> Views
     ModelMetrics --> Dashboard
     ModelFeatures --> Dashboard
+    PipelineMetrics --> Dashboard
     Views --> Dashboard
 ```
 
@@ -169,12 +175,13 @@ flowchart LR
 ```mermaid
 flowchart TB
     subgraph EntryPoint["Punto de Entrada"]
-        TrainScript["train_debit_classifier.py"]
+        TrainScript["train_debit_classifier.py<br/>--split-strategy --feature-set"]
     end
 
     subgraph Pipeline["Pipeline de Entrenamiento"]
-        RunPipeline["run_training_pipeline()"]
-        TrainXGB["train_xgboost()"]
+        MainFn["main()"]
+        RunFS["_run_feature_set()<br/>× Opción A | B"]
+        FilterB["_filter_option_b()<br/>excluye 129 features (Opción B)"]
     end
 
     subgraph Dataset["Artefactos de Entrada"]
@@ -199,7 +206,7 @@ flowchart TB
 
     subgraph Tracking["Experiment Tracking"]
         MLflow["MLflow<br/>debit-models"]
-        ParentRun["Parent Run<br/>+ Child Runs por modelo"]
+        ParentRun["Parent Run por feature_set<br/>+ Child Runs por modelo"]
     end
 
     subgraph Scoring["Servicio de Scoring"]
@@ -208,33 +215,33 @@ flowchart TB
     end
 
     subgraph Output["Salidas"]
-        PKL["model_*.pkl<br/>data/artifacts/"]
+        PKL["model_{name}_{A|B}.pkl<br/>data/artifacts/"]
         Metrics["AUC + KS + Precision/Recall<br/>CV / Train / Test / OOT"]
     end
 
-    TrainScript --> RunPipeline
-    Dataset --> RunPipeline
+    TrainScript --> MainFn
+    Dataset --> MainFn
 
-    RunPipeline --> TrainXGB
-    TrainXGB --> XGB
-    TrainXGB --> GBM
-    TrainXGB --> LR
-    TrainXGB --> RF
+    MainFn --> RunFS
+    RunFS --> FilterB
+    RunFS --> XGB
+    RunFS --> GBM
+    RunFS --> LR
 
     XGB --> Base
     GBM --> Base
     LR --> Base
     RF --> Base
 
-    RunPipeline --> Optuna
+    RunFS --> Optuna
     Optuna --> EvalCV
     EvalCV --> Base
 
-    RunPipeline --> MLflow
+    RunFS --> MLflow
     MLflow --> ParentRun
 
-    RunPipeline --> PKL
-    RunPipeline --> Metrics
+    RunFS --> PKL
+    RunFS --> Metrics
 
     PKL --> ScoringService
     ScoringService --> Segments
@@ -346,22 +353,40 @@ erDiagram
     }
 
     debit_model_metrics {
-        int id PK
+        varchar run_id PK
         varchar model_name
         varchar split_strategy
+        varchar feature_set
         float cv_auc
         float train_auc
         float test_auc
         float oot_auc
         float train_ks
         float test_ks
+        int train_size
+        int test_size
+        int oot_size
+        timestamp run_date
     }
 
     debit_model_features {
         int id PK
-        varchar model_name FK
+        varchar run_id FK
+        varchar model_name
         varchar feature_name
+        varchar split_strategy
+        varchar feature_set
         float importance
+        int rank
+    }
+
+    debit_pipeline_metrics {
+        int id PK
+        varchar run_id
+        varchar stage
+        varchar metric_name
+        float metric_value
+        timestamp run_date
     }
 
     debit_client ||--|| debit_pago : "join (num_doc, obl17, f_analisis)"
@@ -369,7 +394,8 @@ erDiagram
     debit_client ||--|| debit_gestion : "join"
     debit_client ||--|| debit_mora : "join"
     debit_client ||--o| debit_canal : "left join (20.7% cobertura)"
-    debit_model_metrics ||--o{ debit_model_features : "tiene features"
+    debit_model_metrics ||--o{ debit_model_features : "run_id → 50 features SHAP"
+    debit_model_metrics ||--o{ debit_pipeline_metrics : "run_id → métricas pipeline"
 ```
 
 ## Estructura del Proyecto
@@ -380,8 +406,9 @@ flowchart TB
         subgraph Deploy["deploy/"]
             TrainScript["train_debit_classifier.py<br/>Entrypoint ML multi-modelo"]
             ExportMetrics["export_model_metrics.py<br/>MLflow → debit_model_metrics"]
-            ExportSHAP["export_shap_features.py<br/>SHAP → gradient_boosting"]
-            MetabaseProv["metabase_provisioning.py<br/>10 cards + dashboard (idempotente)"]
+            ExportSHAP["export_shap_features.py<br/>SHAP XGB/GBM/LogReg → debit_model_features"]
+            ExportPipeline["export_pipeline_metrics.py<br/>pipeline → debit_pipeline_metrics"]
+            MetabaseProv["metabase_provisioning.py<br/>18 cards + dashboard (idempotente)"]
             Entrypoint["entrypoint.sh<br/>alembic upgrade + cmd"]
             DF["Dockerfile"]
             DFA["Dockerfile.airflow"]
@@ -411,7 +438,6 @@ flowchart TB
                 DebitModel["debit.py<br/>6 SQLModel tables"]
             end
             subgraph ServicesMod["services/"]
-                Training["training.py<br/>run_training_pipeline()"]
                 Forecast["forecasting.py<br/>DebitScoringService"]
                 Optim["optimization.py<br/>ModelSelectionService"]
             end
@@ -458,7 +484,7 @@ flowchart LR
         T2["T2 build_analytical_model<br/>src.dataset.data_preparation"]
         T3["T3 build_features<br/>src.dataset.feature_engineering"]
         T35["T3.5 select_features<br/>src.dataset.feature_selection"]
-        T4["T4 train_model<br/>src.services.training"]
+        T4["T4 train_model<br/>deploy.train_debit_classifier"]
         T5["T5 provision_metabase<br/>deploy.metabase_provisioning"]
     end
 
@@ -483,7 +509,7 @@ flowchart LR
 flowchart TB
     subgraph Input["Entrada — DebitScoringService"]
         PKL["model_*.pkl<br/>(gradient_boosting — mejor AUC OOT)"]
-        Features["116 features<br/>feature_cols.json"]
+        Features["60 features (Opción A) / 19 features (Opción B)<br/>feature_cols.json"]
     end
 
     subgraph Score["Scoring"]
@@ -528,10 +554,11 @@ flowchart TB
 | Base de datos | PostgreSQL 17 | Persistencia de datos y vistas Metabase |
 | ML Tracking | MLflow | Registro de experimentos y artefactos |
 | Optimización | Optuna | Hyperparameter tuning (n_trials=5) |
-| Visualización | Metabase | Dashboard de cobranza (10 cards) |
+| Visualización | Metabase | Dashboard de cobranza (18 cards) |
 | Contenedores | Docker Compose | Orquestación de servicios |
 | Gestor de paquetes | UV | Gestión de dependencias Python |
 | Modelos ML | XGBoost, HistGBM, LogisticRegression | Clasificación binaria var_rta |
-| Interpretabilidad | SHAP (TreeExplainer) | Feature importance para HistGBM |
+| Interpretabilidad | SHAP (TreeExplainer + LinearExplainer) | Feature importance para XGBoost, HistGBM y LogisticRegression |
 | ORM | SQLModel + SQLAlchemy | Modelos de datos y migraciones |
-| Migraciones | Alembic | Schema versioning (tablas + vistas) |
+| Migraciones | Alembic | Schema versioning — 5 migraciones aplicadas |
+| Parametrización | `split_strategy` × `feature_set` | 4 configuraciones: A/B × random/temporal |
