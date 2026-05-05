@@ -38,3 +38,84 @@ Este ejercicio será sustentado en una sesión corta (20min), la idea es que mue
 El espacio estará divido en dos. La primera parte mostrarán el desarrollo/análisis realizado y en la segunda una sesión de preguntas.
 Recuerda resolver la prueba basándote en tus fortalezas, sea ingeniera o ciencia o ambas.
 Le agradecemos su participación en este ejercicio 
+
+
+
+
+
+
+CARDS
+
+
+Cards de negocio / EDA
+                                                                                                                                   
+  ┌─────┬────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────┐
+  │  #  │                Card                │                                   Qué te dice                                   │   
+  ├─────┼────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ 1   │ Evolución % Débito Exclusivo por   │ Si la proporción de clase 1 sube o baja en el tiempo → detecta cambios en el    │   
+  │     │ Período                            │ comportamiento de pago de la cartera                                            │
+  ├─────┼────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤   
+  │ 2   │ Volumen de Obligaciones por        │ Cuántas obligaciones llegaron a mora en cada cohorte → tamaño de la cartera por │
+  │     │ Período                            │  período                                                                        │   
+  ├─────┼────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ 3   │ Segmentos de Cobranza —            │ Qué tan grande es cada segmento A/B/C/D sobre el total → dónde se concentra el  │   
+  │     │ Distribución Global                │ esfuerzo de cobranza                                                            │   
+  ├─────┼────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ 4   │ Mix de Canales de Pago por Clase   │ Cómo difiere el uso de débito, físico, virtual y otros entre clase 0 y clase 1  │   
+  │     │                                    │ → valida que clase 1 usa más débito                                             │   
+  ├─────┼────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ 5   │ Efectividad de Gestiones de        │ Si las gestiones, RPC, acuerdos y promesas difieren entre clases → si clase 0   │   
+  │     │ Cobranza por Clase                 │ requiere más intervención humana                                                │   
+  ├─────┼────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ 6   │ Segmentos de Cobranza por Período  │ Cómo evolucionan los segmentos A/B/C/D en el tiempo → tendencias de riesgo de   │   
+  │     │                                    │ la cartera                                                                      │   
+  ├─────┼────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ 7   │ KPI Resumen — Último Período       │ Foto ejecutiva del período más reciente: total obligaciones, % clase 1, % clase │   
+  │     │                                    │  0                                                                              │   
+  └─────┴────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────┘
+                                                                                                                                   
+  ---             
+  Cards de calidad del pipeline
+                                                                                                                                   
+  ┌─────┬────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────┐
+  │  #  │              Card              │                                     Qué te dice                                     │   
+  ├─────┼────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+  │ 11  │ Retención de Datos en Carga    │ Qué % de filas brutas del CSV llegaron a la BD → detecta pérdidas en la carga       │
+  │     │ por Fuente                     │                                                                                     │
+  ├─────┼────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤   
+  │ 12  │ Duplicados Eliminados en Carga │ Cuántos duplicados exactos y por conflicto se descartaron por fuente → calidad del  │
+  │     │                                │ ETL origen                                                                          │   
+  ├─────┼────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+  │ 13  │ Funnel de Selección de         │ Cuántas features quedan en cada etapa (varianza → ANOVA → ElasticNet), por          │   
+  │     │ Features                       │ estrategia de split → qué tan agresiva fue la selección                             │   
+  ├─────┼────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+  │ 14  │ Dimensiones de Particiones     │ Filas, features candidatas/seleccionadas, tasa clase 1 y memoria por partición →    │   
+  │     │ Train / Test / OOT             │ sanidad del split                                                                   │   
+  ├─────┼────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+  │ 15  │ Balance de Clases por          │ Clase 1 vs clase 0 en cada partición → si el split respetó el balance 78/22 %       │   
+  │     │ Partición                      │                                                                                     │   
+  ├─────┼────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+  │ 16  │ Features Seleccionadas por     │ Cuántas features de cada grupo (gestiones, pagos, moras…) quedaron al final → qué   │   
+  │     │ Grupo Temático                 │ fuente de datos aporta más al modelo                                                │   
+  ├─────┼────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+  │ 17  │ Última Fecha de Carga de Datos │ Cuándo se ejecutó por última vez el loader → freshness de los datos en BD           │   
+  ├─────┼────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────┤   
+  │ 18  │ Última Fecha de Entrenamiento  │ Cuándo se entrenó el modelo por última vez → si el modelo está desactualizado       │
+  └─────┴────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────┘   
+                  
+  ---                                                                                                                              
+  Cards de modelos
+
+  ┌─────┬──────────────────────────────┬───────────────────────────────────────────────────────────────────────────────────────┐
+  │  #  │             Card             │                                      Qué te dice                                      │
+  ├─────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────┤
+  │ 8   │ Comparativa AUC y KS por     │ AUC y KS en CV/Train/Test/OOT por modelo y configuración (Opción A/B) → cuál modelo   │
+  │     │ Modelo                       │ generaliza mejor                                                                      │
+  ├─────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────┤   
+  │ 9   │ Estabilidad Train vs Test vs │ Si el AUC cae mucho de train a test/OOT → detecta sobreajuste o degradación temporal  │
+  │     │  OOT                         │                                                                                       │   
+  ├─────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────┤
+  │ 10  │ Top 20 Features por Modelo   │ Qué variables impulsan más la predicción según SHAP → interpretabilidad y validación  │   
+  │     │                              │ de negocio                                                                            │   
+  └─────┴──────────────────────────────┴───────────────────────────────────────────────────────────────────────────────────────┘
+                                                   
